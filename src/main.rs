@@ -3,6 +3,7 @@ mod auth;
 mod cli;
 pub mod config;
 mod models;
+mod serve;
 mod tui;
 
 use anyhow::Result;
@@ -13,6 +14,7 @@ use cli::{Cli, Commands};
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let json = cli.json;
 
     match cli.command {
         Some(Commands::Tui) | None => {
@@ -33,8 +35,20 @@ async fn main() -> Result<()> {
             }
             tui::run(client).await?;
         }
+        Some(Commands::Serve { port, bind }) => {
+            serve::run(&bind, port).await?;
+        }
         Some(cmd) => {
-            cli::run_cli(cmd).await?;
+            if let Err(e) = cli::run_cli(cmd, json).await {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": "error", "message": e.to_string()})
+                    );
+                } else {
+                    return Err(e);
+                }
+            }
         }
     }
 

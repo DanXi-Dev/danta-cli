@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 
 use crate::api::DantaClient;
 use crate::auth;
@@ -9,6 +10,10 @@ use crate::auth;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
+
+    /// Output results as JSON (for agent/programmatic use)
+    #[arg(long, global = true)]
+    pub json: bool,
 }
 
 #[derive(Subcommand)]
@@ -144,29 +149,76 @@ pub enum Commands {
     Punishments,
     /// Open TUI mode
     Tui,
+    /// Start a telnet server exposing the TUI
+    Serve {
+        /// Port to listen on
+        #[arg(short, long, default_value = "2323")]
+        port: u16,
+        /// Address to bind to
+        #[arg(short, long, default_value = "127.0.0.1")]
+        bind: String,
+    },
 }
 
-pub async fn run_cli(cmd: Commands) -> Result<()> {
+// Helper struct for JSON output of View command
+#[derive(Serialize)]
+struct ViewOutput {
+    hole: crate::models::Hole,
+    floors: Vec<crate::models::Floor>,
+}
+
+// Helper for simple status JSON responses
+#[derive(Serialize)]
+struct StatusOutput {
+    status: &'static str,
+    message: String,
+}
+
+fn json_status(msg: impl Into<String>) {
+    let out = StatusOutput {
+        status: "ok",
+        message: msg.into(),
+    };
+    println!("{}", serde_json::to_string(&out).unwrap());
+}
+
+fn json_out<T: Serialize>(data: &T) {
+    println!("{}", serde_json::to_string(data).unwrap());
+}
+
+pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
     match cmd {
         Commands::Login { email, password } => {
             let mut client = DantaClient::new();
             client.login(&email, &password).await?;
             auth::save_token(client.token().unwrap())?;
-            println!("Login successful! Token saved.");
+            if json {
+                json_status("Login successful");
+            } else {
+                println!("Login successful! Token saved.");
+            }
         }
         Commands::Me => {
             let client = get_client().await?;
             let user = client.get_me().await?;
-            println!("User ID:  {}", user.user_id);
-            println!("Nickname: {}", user.nickname);
-            println!("Admin:    {}", user.is_admin);
-            println!("Joined:   {}", user.joined_time);
+            if json {
+                json_out(&user);
+            } else {
+                println!("User ID:  {}", user.user_id);
+                println!("Nickname: {}", user.nickname);
+                println!("Admin:    {}", user.is_admin);
+                println!("Joined:   {}", user.joined_time);
+            }
         }
         Commands::Divisions => {
             let client = get_client().await?;
             let divs = client.get_divisions().await?;
-            for d in divs {
-                println!("[{}] {} - {}", d.id, d.name, d.description);
+            if json {
+                json_out(&divs);
+            } else {
+                for d in divs {
+                    println!("[{}] {} - {}", d.id, d.name, d.description);
+                }
             }
         }
         Commands::Holes {
@@ -176,59 +228,69 @@ pub async fn run_cli(cmd: Commands) -> Result<()> {
         } => {
             let client = get_client().await?;
             let holes = client.get_holes(division, None, limit, &order).await?;
-            for h in holes {
-                let tags: Vec<_> = h.tags.iter().map(|t| t.name.as_str()).collect();
-                let preview = h
-                    .floors
-                    .as_ref()
-                    .and_then(|f| f.first_floor.as_ref())
-                    .map(|f| truncate_str(&f.content.replace('\n', " "), 40))
-                    .unwrap_or_default();
-                println!(
-                    "#{} [{}] {} | {}回复 {}浏览",
-                    h.id,
-                    tags.join(", "),
-                    preview,
-                    h.reply,
-                    h.view,
-                );
+            if json {
+                json_out(&holes);
+            } else {
+                for h in holes {
+                    let tags: Vec<_> = h.tags.iter().map(|t| t.name.as_str()).collect();
+                    let preview = h
+                        .floors
+                        .as_ref()
+                        .and_then(|f| f.first_floor.as_ref())
+                        .map(|f| truncate_str(&f.content.replace('\n', " "), 40))
+                        .unwrap_or_default();
+                    println!(
+                        "#{} [{}] {} | {}回复 {}浏览",
+                        h.id,
+                        tags.join(", "),
+                        preview,
+                        h.reply,
+                        h.view,
+                    );
+                }
             }
         }
         Commands::View { hole_id, limit } => {
             let client = get_client().await?;
             let hole = client.get_hole(hole_id).await?;
-            let tags: Vec<_> = hole.tags.iter().map(|t| t.name.as_str()).collect();
-            println!("═══ Hole #{} [{}] ═══", hole.id, tags.join(", "));
-            println!(
-                "{}回复 | {}浏览 | {}",
-                hole.reply, hole.view, hole.time_created
-            );
-            println!();
-
             let floors = client.get_floors(hole_id, 0, limit).await?;
-            for (i, f) in floors.iter().enumerate() {
-                let prefix = if i == 0 { "OP" } else { &format!("#{}", i) };
+            if json {
+                json_out(&ViewOutput { hole, floors });
+            } else {
+                let tags: Vec<_> = hole.tags.iter().map(|t| t.name.as_str()).collect();
+                println!("═══ Hole #{} [{}] ═══", hole.id, tags.join(", "));
                 println!(
-                    "── {} ({}) [floor:{}] {} ──",
-                    prefix, f.anonyname, f.id, f.time_created
+                    "{}回复 | {}浏览 | {}",
+                    hole.reply, hole.view, hole.time_created
                 );
-                println!("{}", f.content);
-                if f.like > 0 || f.dislike > 0 {
-                    print!("  +{} -{}", f.like, f.dislike);
-                }
-                if f.is_me {
-                    print!("  [mine]");
-                }
-                if f.like > 0 || f.dislike > 0 || f.is_me {
+                println!();
+
+                for (i, f) in floors.iter().enumerate() {
+                    let prefix = if i == 0 { "OP" } else { &format!("#{}", i) };
+                    println!(
+                        "── {} ({}) [floor:{}] {} ──",
+                        prefix, f.anonyname, f.id, f.time_created
+                    );
+                    println!("{}", f.content);
+                    if f.like > 0 || f.dislike > 0 {
+                        print!("  +{} -{}", f.like, f.dislike);
+                    }
+                    if f.is_me {
+                        print!("  [mine]");
+                    }
+                    if f.like > 0 || f.dislike > 0 || f.is_me {
+                        println!();
+                    }
                     println!();
                 }
-                println!();
             }
         }
         Commands::Search { query, limit } => {
             let client = get_client().await?;
             let floors = client.search_floors(&query, 0, limit).await?;
-            if floors.is_empty() {
+            if json {
+                json_out(&floors);
+            } else if floors.is_empty() {
                 println!("No results found.");
             } else {
                 for f in floors {
@@ -252,35 +314,53 @@ pub async fn run_cli(cmd: Commands) -> Result<()> {
                 tags.split(',').map(|s| s.trim().to_string()).collect()
             };
             let hole = client.create_hole(division, &content, &tag_names).await?;
-            println!("Created hole #{}", hole.id);
+            if json {
+                json_out(&hole);
+            } else {
+                println!("Created hole #{}", hole.id);
+            }
         }
         Commands::Reply { hole_id, content } => {
             let client = get_client().await?;
             let floor = client.reply_to_hole(hole_id, &content).await?;
-            println!("Replied as floor #{} ({})", floor.id, floor.anonyname);
+            if json {
+                json_out(&floor);
+            } else {
+                println!("Replied as floor #{} ({})", floor.id, floor.anonyname);
+            }
         }
         Commands::Like { floor_id, value } => {
             let client = get_client().await?;
             let floor = client.like_floor(floor_id, value).await?;
-            let action = match value {
-                1 => "Liked",
-                -1 => "Disliked",
-                _ => "Reset",
-            };
-            println!(
-                "{} floor #{} (now +{} -{})",
-                action, floor.id, floor.like, floor.dislike
-            );
+            if json {
+                json_out(&floor);
+            } else {
+                let action = match value {
+                    1 => "Liked",
+                    -1 => "Disliked",
+                    _ => "Reset",
+                };
+                println!(
+                    "{} floor #{} (now +{} -{})",
+                    action, floor.id, floor.like, floor.dislike
+                );
+            }
         }
         Commands::DeleteFloor { floor_id, reason } => {
             let client = get_client().await?;
             client.delete_floor(floor_id, &reason).await?;
-            println!("Deleted floor #{}", floor_id);
+            if json {
+                json_status(format!("Deleted floor #{}", floor_id));
+            } else {
+                println!("Deleted floor #{}", floor_id);
+            }
         }
         Commands::History { floor_id } => {
             let client = get_client().await?;
             let history = client.get_floor_history(floor_id).await?;
-            if history.is_empty() {
+            if json {
+                json_out(&history);
+            } else if history.is_empty() {
                 println!("No edit history for floor #{}.", floor_id);
             } else {
                 for (i, h) in history.iter().enumerate() {
@@ -293,17 +373,27 @@ pub async fn run_cli(cmd: Commands) -> Result<()> {
         Commands::Fav { hole_id } => {
             let client = get_client().await?;
             client.add_favorite(hole_id).await?;
-            println!("Added hole #{} to favorites.", hole_id);
+            if json {
+                json_status(format!("Added hole #{} to favorites", hole_id));
+            } else {
+                println!("Added hole #{} to favorites.", hole_id);
+            }
         }
         Commands::Unfav { hole_id } => {
             let client = get_client().await?;
             client.remove_favorite(hole_id).await?;
-            println!("Removed hole #{} from favorites.", hole_id);
+            if json {
+                json_status(format!("Removed hole #{} from favorites", hole_id));
+            } else {
+                println!("Removed hole #{} from favorites.", hole_id);
+            }
         }
         Commands::Favs => {
             let client = get_client().await?;
             let ids = client.get_favorite_ids().await?;
-            if ids.is_empty() {
+            if json {
+                json_out(&ids);
+            } else if ids.is_empty() {
                 println!("No favorites.");
             } else {
                 println!("Favorites ({}):", ids.len());
@@ -315,17 +405,27 @@ pub async fn run_cli(cmd: Commands) -> Result<()> {
         Commands::Sub { hole_id } => {
             let client = get_client().await?;
             client.add_subscription(hole_id).await?;
-            println!("Subscribed to hole #{}.", hole_id);
+            if json {
+                json_status(format!("Subscribed to hole #{}", hole_id));
+            } else {
+                println!("Subscribed to hole #{}.", hole_id);
+            }
         }
         Commands::Unsub { hole_id } => {
             let client = get_client().await?;
             client.remove_subscription(hole_id).await?;
-            println!("Unsubscribed from hole #{}.", hole_id);
+            if json {
+                json_status(format!("Unsubscribed from hole #{}", hole_id));
+            } else {
+                println!("Unsubscribed from hole #{}.", hole_id);
+            }
         }
         Commands::Subs => {
             let client = get_client().await?;
             let ids = client.get_subscription_ids().await?;
-            if ids.is_empty() {
+            if json {
+                json_out(&ids);
+            } else if ids.is_empty() {
                 println!("No subscriptions.");
             } else {
                 println!("Subscriptions ({}):", ids.len());
@@ -337,7 +437,9 @@ pub async fn run_cli(cmd: Commands) -> Result<()> {
         Commands::Messages { unread } => {
             let client = get_client().await?;
             let msgs = client.get_messages(unread).await?;
-            if msgs.is_empty() {
+            if json {
+                json_out(&msgs);
+            } else if msgs.is_empty() {
                 println!("No messages.");
             } else {
                 for m in msgs {
@@ -355,24 +457,38 @@ pub async fn run_cli(cmd: Commands) -> Result<()> {
         Commands::ClearMessages => {
             let client = get_client().await?;
             client.clear_messages().await?;
-            println!("All messages cleared.");
+            if json {
+                json_status("All messages cleared");
+            } else {
+                println!("All messages cleared.");
+            }
         }
         Commands::Report { floor_id, reason } => {
             let client = get_client().await?;
             client.report_floor(floor_id, &reason).await?;
-            println!("Reported floor #{}.", floor_id);
+            if json {
+                json_status(format!("Reported floor #{}", floor_id));
+            } else {
+                println!("Reported floor #{}.", floor_id);
+            }
         }
         Commands::Tags => {
             let client = get_client().await?;
             let tags = client.get_tags().await?;
-            for t in tags {
-                println!("[{}] {} (temperature: {})", t.id, t.name, t.temperature);
+            if json {
+                json_out(&tags);
+            } else {
+                for t in tags {
+                    println!("[{}] {} (temperature: {})", t.id, t.name, t.temperature);
+                }
             }
         }
         Commands::MyHoles { limit } => {
             let client = get_client().await?;
             let holes = client.get_my_holes(None, limit).await?;
-            if holes.is_empty() {
+            if json {
+                json_out(&holes);
+            } else if holes.is_empty() {
                 println!("No holes posted.");
             } else {
                 for h in holes {
@@ -389,7 +505,9 @@ pub async fn run_cli(cmd: Commands) -> Result<()> {
         Commands::MyFloors { limit } => {
             let client = get_client().await?;
             let floors = client.get_my_floors(0, limit).await?;
-            if floors.is_empty() {
+            if json {
+                json_out(&floors);
+            } else if floors.is_empty() {
                 println!("No floors posted.");
             } else {
                 for f in floors {
@@ -401,24 +519,34 @@ pub async fn run_cli(cmd: Commands) -> Result<()> {
         Commands::EditFloor { floor_id, content } => {
             let client = get_client().await?;
             let floor = client.edit_floor(floor_id, &content).await?;
-            println!("Edited floor #{}", floor.id);
+            if json {
+                json_out(&floor);
+            } else {
+                println!("Edited floor #{}", floor.id);
+            }
         }
         Commands::Floor { floor_id } => {
             let client = get_client().await?;
             let f = client.get_floor(floor_id).await?;
-            println!(
-                "Floor #{} in Hole #{} ({}) {}",
-                f.id, f.hole_id, f.anonyname, f.time_created
-            );
-            println!("{}", f.content);
-            if f.like > 0 || f.dislike > 0 {
-                println!("  +{} -{}", f.like, f.dislike);
+            if json {
+                json_out(&f);
+            } else {
+                println!(
+                    "Floor #{} in Hole #{} ({}) {}",
+                    f.id, f.hole_id, f.anonyname, f.time_created
+                );
+                println!("{}", f.content);
+                if f.like > 0 || f.dislike > 0 {
+                    println!("  +{} -{}", f.like, f.dislike);
+                }
             }
         }
         Commands::Punishments => {
             let client = get_client().await?;
             let puns = client.get_my_punishments().await?;
-            if puns.is_empty() {
+            if json {
+                json_out(&puns);
+            } else if puns.is_empty() {
                 println!("No punishments.");
             } else {
                 for p in puns {
@@ -429,7 +557,7 @@ pub async fn run_cli(cmd: Commands) -> Result<()> {
                 }
             }
         }
-        Commands::Tui => unreachable!(),
+        Commands::Tui | Commands::Serve { .. } => unreachable!(),
     }
     Ok(())
 }
