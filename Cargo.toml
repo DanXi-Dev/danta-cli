@@ -1,0 +1,33 @@
+[package]
+name = "danta-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI/TUI client for FDU Hole (树洞) forum"
+
+[dependencies]
+# HTTP & async
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# TUI
+ratatui = "0.30"
+crossterm = "0.29"
+ratatui-image = { version = "10.0", default-features = false, features = ["crossterm"] }
+image = "0.25"
+
+# Misc
+anyhow = "1"
+dirs = "6"
+chrono = { version = "0.4", features = ["serde"] }
+textwrap = "0.16"
+unicode-width = "0.2"
+urlencoding = "2"
+toml = "0.8"
+regex = "1"
