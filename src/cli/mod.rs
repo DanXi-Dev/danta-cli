@@ -34,8 +34,8 @@ pub enum Commands {
         /// Division ID (default: 1 = 茶楼)
         #[arg(short, long, default_value = "1")]
         division: i64,
-        /// Number of holes to fetch (max 10)
-        #[arg(short, long, default_value = "10")]
+        /// Number of holes to fetch
+        #[arg(short, long, default_value = "20")]
         limit: u32,
         /// Sort order: time_updated or time_created
         #[arg(short, long, default_value = "time_updated")]
