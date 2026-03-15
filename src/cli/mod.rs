@@ -40,6 +40,9 @@ pub enum Commands {
         /// Sort order: time_updated or time_created
         #[arg(short, long, default_value = "time_updated")]
         order: String,
+        /// Pagination offset (start_time cursor)
+        #[arg(long)]
+        offset: Option<String>,
     },
     /// View a specific hole and its floors
     View {
@@ -234,9 +237,12 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             division,
             limit,
             order,
+            offset,
         } => {
             let client = get_client().await?;
-            let holes = client.get_holes(division, None, limit, &order).await?;
+            let holes = client
+                .get_holes(division, offset.as_deref(), limit, &order)
+                .await?;
             if json {
                 json_out(&holes);
             } else {
