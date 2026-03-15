@@ -6,7 +6,7 @@ use crate::api::DantaClient;
 use crate::auth;
 
 #[derive(Parser)]
-#[command(name = "danta", about = "FDU Hole (树洞) CLI/TUI client")]
+#[command(name = "danta", about = "FDU Hole (树洞) CLI/TUI client", version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
