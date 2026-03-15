@@ -159,6 +159,8 @@ pub enum Commands {
     },
     /// List your punishments
     Punishments,
+    /// Check authentication status
+    Status,
     /// Open TUI mode
     Tui,
     /// Start a telnet server exposing the TUI
@@ -580,6 +582,68 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
                         "[{}] {} days: {} ({} ~ {})",
                         p.id, p.duration, p.reason, p.start_time, p.end_time
                     );
+                }
+            }
+        }
+        Commands::Status => {
+            let token = auth::load_token();
+            match token {
+                Err(e) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({"status": "error", "message": e.to_string()})
+                        );
+                    } else {
+                        println!("Not logged in: {}", e);
+                    }
+                }
+                Ok(t) => {
+                    let mut client = DantaClient::with_token(t);
+                    match client.get_me().await {
+                        Ok(user) => {
+                            if json {
+                                json_out(&serde_json::json!({
+                                    "status": "ok",
+                                    "user_id": user.user_id,
+                                    "nickname": user.nickname,
+                                }));
+                            } else {
+                                println!("Token valid");
+                                println!("User ID:  {}", user.user_id);
+                                println!("Nickname: {}", user.nickname);
+                            }
+                        }
+                        Err(e) => {
+                            match client.ensure_token().await {
+                                Ok(true) => {
+                                    auth::save_token(client.token().unwrap())?;
+                                    let user = client.get_me().await?;
+                                    if json {
+                                        json_out(&serde_json::json!({
+                                            "status": "ok",
+                                            "user_id": user.user_id,
+                                            "nickname": user.nickname,
+                                        }));
+                                    } else {
+                                        println!("Token refreshed");
+                                        println!("User ID:  {}", user.user_id);
+                                        println!("Nickname: {}", user.nickname);
+                                    }
+                                }
+                                _ => {
+                                    if json {
+                                        println!(
+                                            "{}",
+                                            serde_json::json!({"status": "error", "message": e.to_string()})
+                                        );
+                                    } else {
+                                        println!("Token invalid: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
