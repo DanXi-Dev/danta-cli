@@ -43,6 +43,9 @@ pub enum Commands {
         /// Pagination offset (start_time cursor)
         #[arg(long)]
         offset: Option<String>,
+        /// Filter by tag name (client-side)
+        #[arg(long)]
+        tag: Option<String>,
     },
     /// View a specific hole and its floors
     View {
@@ -240,11 +243,19 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             limit,
             order,
             offset,
+            tag,
         } => {
             let client = get_client().await?;
             let holes = client
                 .get_holes(division, offset.as_deref(), limit, &order)
                 .await?;
+            let holes: Vec<_> = match &tag {
+                Some(filter) => holes
+                    .into_iter()
+                    .filter(|h| h.tags.iter().any(|t| &t.name == filter))
+                    .collect(),
+                None => holes,
+            };
             if json {
                 json_out(&holes);
             } else {
