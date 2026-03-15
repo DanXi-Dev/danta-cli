@@ -1,1 +1,5 @@
 /target
+.DS_Store
+serve.log
+serve2.log
+target/

@@ -1,5 +1,0 @@
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.57s
-     Running `target/debug/danta-cli serve -p 2326`
-Danta TUI server listening on 127.0.0.1:2326
-Connect with: nc 127.0.0.1 2326 or telnet 127.0.0.1 2326
-[+] Connection from 127.0.0.1:51985
