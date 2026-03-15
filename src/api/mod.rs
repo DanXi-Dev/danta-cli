@@ -206,17 +206,22 @@ impl DantaClient {
     // Floors
     // ═══════════════════════════════════════
 
-    pub async fn get_floors(&self, hole_id: i64, offset: u32, size: u32) -> Result<Vec<Floor>> {
+    pub async fn get_floors(
+        &self,
+        hole_id: i64,
+        offset: u32,
+        size: u32,
+        order: Option<&str>,
+    ) -> Result<Vec<Floor>> {
         let (k, v) = self.auth_header()?;
-        let resp = self
-            .http
-            .get(format!(
-                "{FORUM_BASE}/holes/{}/floors?offset={}&size={}",
-                hole_id, offset, size
-            ))
-            .header(k, v)
-            .send()
-            .await?;
+        let mut url = format!(
+            "{FORUM_BASE}/holes/{}/floors?offset={}&size={}",
+            hole_id, offset, size
+        );
+        if let Some(ord) = order {
+            url.push_str(&format!("&order={}", ord));
+        }
+        let resp = self.http.get(&url).header(k, v).send().await?;
         let resp = check(resp, "Get floors").await?;
         Ok(resp.json().await?)
     }

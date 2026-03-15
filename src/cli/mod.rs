@@ -47,6 +47,15 @@ pub enum Commands {
         /// Number of floors to fetch
         #[arg(short, long, default_value = "30")]
         limit: u32,
+        /// Offset (for pagination)
+        #[arg(short, long, default_value = "0")]
+        offset: u32,
+        /// Sort by: id (or omit for default)
+        #[arg(long)]
+        order: Option<String>,
+        /// Reverse order (show latest floors first)
+        #[arg(short, long)]
+        reverse: bool,
     },
     /// Search floors
     Search {
@@ -250,10 +259,21 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
                 }
             }
         }
-        Commands::View { hole_id, limit } => {
+        Commands::View {
+            hole_id,
+            limit,
+            offset,
+            order,
+            reverse,
+        } => {
             let client = get_client().await?;
             let hole = client.get_hole(hole_id).await?;
-            let floors = client.get_floors(hole_id, 0, limit).await?;
+            let mut floors = client
+                .get_floors(hole_id, offset, limit, order.as_deref())
+                .await?;
+            if reverse {
+                floors.reverse();
+            }
             if json {
                 json_out(&ViewOutput { hole, floors });
             } else {

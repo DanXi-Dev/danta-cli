@@ -557,7 +557,7 @@ async fn load_hole_detail(app: &mut App, hole_id: i64) {
             return;
         }
     }
-    match app.client.get_floors(hole_id, 0, app.config.floors_per_page).await {
+    match app.client.get_floors(hole_id, 0, app.config.floors_per_page, None).await {
         Ok(floors) => {
             app.floors_all_loaded = (floors.len() as u32) < app.config.floors_per_page;
             prefetch_floor_images(app, &floors);
@@ -580,7 +580,7 @@ async fn load_more_floors(app: &mut App) {
         None => return,
     };
     let offset = app.floors.len() as u32;
-    match app.client.get_floors(hole_id, offset, app.config.floors_per_page).await {
+    match app.client.get_floors(hole_id, offset, app.config.floors_per_page, None).await {
         Ok(new_floors) => {
             if (new_floors.len() as u32) < app.config.floors_per_page {
                 app.floors_all_loaded = true;
@@ -1223,7 +1223,7 @@ async fn handle_input_keys(app: &mut App, key: KeyCode, modifiers: KeyModifiers)
                                 app.status =
                                     format!("Replied as {} (floor #{})", floor.anonyname, floor.id);
                                 app.view = View::HoleDetail;
-                                if let Ok(floors) = app.client.get_floors(hid, 0, 50).await {
+                                if let Ok(floors) = app.client.get_floors(hid, 0, 50, None).await {
                                     app.floors = floors;
                                     app.floor_selected = app.floors.len().saturating_sub(1);
                                     // scroll will be auto-adjusted in render
