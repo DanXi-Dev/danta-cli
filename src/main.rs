@@ -3,6 +3,7 @@ mod auth;
 mod cli;
 pub mod config;
 mod models;
+#[cfg(unix)]
 mod serve;
 mod tui;
 
@@ -35,8 +36,14 @@ async fn main() -> Result<()> {
             }
             tui::run(client).await?;
         }
+        #[cfg(unix)]
         Some(Commands::Serve { port, bind }) => {
             serve::run(&bind, port).await?;
+        }
+        #[cfg(not(unix))]
+        Some(Commands::Serve { .. }) => {
+            eprintln!("Serve mode is only supported on Unix systems.");
+            std::process::exit(1);
         }
         Some(cmd) => {
             if let Err(e) = cli::run_cli(cmd, json).await {
