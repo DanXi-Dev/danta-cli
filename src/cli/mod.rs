@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use regex::Regex;
 use serde::Serialize;
 
 use crate::api::DantaClient;
@@ -140,6 +141,10 @@ pub enum Commands {
     },
     /// List all tags
     Tags,
+    /// Extract image URLs from all floors of a hole
+    Images {
+        hole_id: i64,
+    },
     /// List your own holes
     MyHoles {
         #[arg(short, long, default_value = "10")]
@@ -655,6 +660,46 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
                             }
                         }
                     }
+                }
+            }
+        }
+        Commands::Images { hole_id } => {
+            let client = get_client().await?;
+            let hole = client.get_hole(hole_id).await?;
+            let total = hole.reply as u32 + 1;
+            let floors = client.get_floors(hole_id, 0, total.max(100), None).await?;
+
+            let md_img = Regex::new(r"!\[[^\]]*\]\((https?://[^)]+)\)").unwrap();
+            let bare_url =
+                Regex::new(r"https?://\S+\.(?:jpg|jpeg|png|gif|webp)(?:\?\S*)?").unwrap();
+
+            let urls: Vec<String> = floors
+                .iter()
+                .flat_map(|f| {
+                    let mut found: Vec<String> = Vec::new();
+                    for cap in md_img.captures_iter(&f.content) {
+                        found.push(cap[1].to_string());
+                    }
+                    for cap in bare_url.captures_iter(&f.content) {
+                        let url = cap[0].to_string();
+                        if !found.contains(&url) {
+                            found.push(url);
+                        }
+                    }
+                    found
+                })
+                .filter(|url| {
+                    let filename = url.rsplit('/').next().unwrap_or("");
+                    let filename = filename.split('?').next().unwrap_or(filename);
+                    !filename.starts_with("dx_")
+                })
+                .collect();
+
+            if json {
+                json_out(&urls);
+            } else {
+                for url in &urls {
+                    println!("{}", url);
                 }
             }
         }
