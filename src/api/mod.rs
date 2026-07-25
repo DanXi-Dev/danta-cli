@@ -6,6 +6,7 @@ use crate::models::*;
 
 const AUTH_BASE: &str = "https://auth.fduhole.com/api";
 const FORUM_BASE: &str = "https://forum.fduhole.com/api";
+const CURRICULUM_BASE: &str = "https://danke.fduhole.com/api";
 
 #[derive(Clone)]
 pub struct DantaClient {
@@ -573,6 +574,93 @@ impl DantaClient {
             .send()
             .await?;
         let resp = check(resp, "Get my floors").await?;
+        Ok(resp.json().await?)
+    }
+
+    // ═══════════════════════════════════════
+    // Curriculum (课评 / Danke)
+    // ═══════════════════════════════════════
+
+    pub async fn list_course_groups(&self) -> Result<Vec<CourseGroup>> {
+        let (k, v) = self.auth_header()?;
+        let resp = self
+            .http
+            .get(format!("{CURRICULUM_BASE}/courses"))
+            .header(k, v)
+            .send()
+            .await?;
+        let resp = check(resp, "List course groups").await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn get_course_group(&self, group_id: i64) -> Result<CourseGroup> {
+        let (k, v) = self.auth_header()?;
+        let resp = self
+            .http
+            .get(format!("{CURRICULUM_BASE}/group/{}", group_id))
+            .header(k, v)
+            .send()
+            .await?;
+        let resp = check(resp, "Get course group").await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn get_course(&self, course_id: i64) -> Result<Course> {
+        let (k, v) = self.auth_header()?;
+        let resp = self
+            .http
+            .get(format!("{CURRICULUM_BASE}/courses/{}", course_id))
+            .header(k, v)
+            .send()
+            .await?;
+        let resp = check(resp, "Get course").await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn list_reviews(&self, course_id: i64) -> Result<Vec<Review>> {
+        let (k, v) = self.auth_header()?;
+        let resp = self
+            .http
+            .get(format!(
+                "{CURRICULUM_BASE}/courses/{}/reviews",
+                course_id
+            ))
+            .header(k, v)
+            .send()
+            .await?;
+        let resp = check(resp, "List reviews").await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn create_review(
+        &self,
+        course_id: i64,
+        title: &str,
+        content: &str,
+        rank: &Rank,
+    ) -> Result<Review> {
+        let (k, v) = self.auth_header()?;
+        let body = serde_json::json!({
+            "title": title,
+            "content": content,
+            "rank": {
+                "overall": rank.overall,
+                "content": rank.content,
+                "workload": rank.workload,
+                "assessment": rank.assessment,
+            }
+        });
+        let resp = self
+            .http
+            .post(format!(
+                "{CURRICULUM_BASE}/courses/{}/reviews",
+                course_id
+            ))
+            .header(k, v)
+            .json(&body)
+            .send()
+            .await?;
+        let resp = check(resp, "Create review").await?;
         Ok(resp.json().await?)
     }
 }

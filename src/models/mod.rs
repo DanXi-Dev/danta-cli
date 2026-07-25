@@ -182,3 +182,99 @@ pub struct User {
     #[serde(default)]
     pub joined_time: String,
 }
+
+// ── Curriculum (课评 / Danke) ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CourseGroup {
+    pub id: i64,
+    pub name: String,
+    pub code: String,
+    #[serde(default)]
+    pub department: String,
+    #[serde(default, rename = "campus_name")]
+    pub campus: String,
+    #[serde(default, rename = "course_list")]
+    pub courses: Vec<Course>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Course {
+    pub id: i64,
+    #[serde(default)]
+    pub credit: f64,
+    pub name: String,
+    pub code: String,
+    #[serde(default, rename = "code_id")]
+    pub code_id: String,
+    #[serde(default)]
+    pub department: String,
+    #[serde(default, rename = "campus_name")]
+    pub campus: String,
+    #[serde(default)]
+    pub teachers: String,
+    #[serde(default, rename = "max_student")]
+    pub max_student: i64,
+    #[serde(default, rename = "week_hour")]
+    pub week_hour: i64,
+    #[serde(default)]
+    pub year: i64,
+    #[serde(default)]
+    pub semester: i64,
+    #[serde(default)]
+    pub reviews: Vec<Review>,
+}
+
+impl Course {
+    pub fn semester_name(&self) -> String {
+        let term = if self.semester % 2 == 1 { "秋" } else { "春" };
+        format!("{}-{} {}", self.year, self.year + 1, term)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Review {
+    pub id: i64,
+    #[serde(default, rename = "reviewer_id")]
+    pub reviewer_id: i64,
+    pub title: String,
+    pub content: String,
+    #[serde(default, rename = "time_created")]
+    pub time_created: String,
+    #[serde(default, rename = "time_updated")]
+    pub time_updated: String,
+    #[serde(default, rename = "is_me")]
+    pub is_me: bool,
+    #[serde(default)]
+    pub remark: i64,
+    #[serde(default)]
+    pub vote: i64,
+    pub rank: Rank,
+    #[serde(default)]
+    pub extra: CurriculumExtra,
+    #[serde(default)]
+    pub history: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CurriculumExtra {
+    #[serde(default)]
+    pub achievements: Vec<Achievement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Achievement {
+    pub name: String,
+    #[serde(default, rename = "obtainDate")]
+    pub obtain_date: String,
+    #[serde(default)]
+    pub domain: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rank {
+    pub overall: f64,
+    pub content: f64,
+    pub workload: f64,
+    pub assessment: f64,
+}

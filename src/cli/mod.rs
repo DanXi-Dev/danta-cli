@@ -180,6 +180,23 @@ pub enum Commands {
         #[arg(short, long, default_value = "127.0.0.1")]
         bind: String,
     },
+    /// List course groups (课评)
+    Courses {
+        /// Group ID to view (omit to list all groups)
+        #[arg(short, long)]
+        group: Option<i64>,
+        /// Filter courses by name keyword (client-side)
+        #[arg(short, long)]
+        search: Option<String>,
+    },
+    /// View a specific course and its reviews
+    Course {
+        course_id: i64,
+    },
+    /// List reviews for a course
+    Reviews {
+        course_id: i64,
+    },
 }
 
 // Helper struct for JSON output of View command
@@ -704,8 +721,150 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Tui | Commands::Serve { .. } => unreachable!(),
+        Commands::Courses { group, search } => {
+            let client = get_client().await?;
+            if let Some(gid) = group {
+                let cg = client.get_course_group(gid).await?;
+                let courses = apply_search(&cg.courses, &search);
+                output_courses(&cg, &courses, json);
+            } else {
+                let groups = client.list_course_groups().await?;
+                if json {
+                    json_out(&groups);
+                } else {
+                    for g in &groups {
+                        let count = g.courses.len();
+                        println!(
+                            "[{}] {} ({}) — {} courses",
+                            g.id, g.name, g.code, count
+                        );
+                    }
+                }
+            }
+        }
+        Commands::Course { course_id } => {
+            let client = get_client().await?;
+            let course = client.get_course(course_id).await?;
+            let reviews = client.list_reviews(course_id).await?;
+            if json {
+                #[derive(Serialize)]
+                struct CourseOutput {
+                    course: crate::models::Course,
+                    reviews: Vec<crate::models::Review>,
+                }
+                json_out(&CourseOutput { course, reviews });
+            } else {
+                print_course(&course, &reviews);
+            }
+        }
+        Commands::Reviews { course_id } => {
+            let client = get_client().await?;
+            let reviews = client.list_reviews(course_id).await?;
+            if json {
+                json_out(&reviews);
+            } else {
+                print_reviews(&reviews);
+            }
+        }
     }
     Ok(())
+}
+
+fn apply_search<'a>(courses: &'a [crate::models::Course], keyword: &Option<String>) -> Vec<&'a crate::models::Course> {
+    match keyword {
+        Some(kw) if !kw.is_empty() => courses
+            .iter()
+            .filter(|c| {
+                c.name.contains(kw.as_str())
+                    || c.code.contains(kw.as_str())
+                    || c.teachers.contains(kw.as_str())
+            })
+            .collect(),
+        _ => courses.iter().collect(),
+    }
+}
+
+fn output_courses(
+    group: &crate::models::CourseGroup,
+    courses: &[&crate::models::Course],
+    json: bool,
+) {
+    if json {
+        json_out(&courses);
+    } else {
+        println!("── {} [{}] ──", group.name, group.code);
+        if courses.is_empty() {
+            println!("  (no courses found)");
+        } else {
+            for c in courses {
+                let stars = if !c.reviews.is_empty() {
+                    let avg: f64 = c.reviews.iter().map(|r| r.rank.overall).sum::<f64>()
+                        / c.reviews.len() as f64;
+                    format!(" ★{:.1} ({} reviews)", avg, c.reviews.len())
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  [#{}] {} ({}) | {} credits | {} | {}{}",
+                    c.id,
+                    c.name,
+                    c.code,
+                    c.credit,
+                    c.teachers,
+                    c.semester_name(),
+                    stars,
+                );
+            }
+        }
+    }
+}
+
+fn print_course(course: &crate::models::Course, reviews: &[crate::models::Review]) {
+    let avg_rank = if !reviews.is_empty() {
+        let n = reviews.len() as f64;
+        let overall: f64 = reviews.iter().map(|r| r.rank.overall).sum();
+        let content: f64 = reviews.iter().map(|r| r.rank.content).sum();
+        let workload: f64 = reviews.iter().map(|r| r.rank.workload).sum();
+        let assessment: f64 = reviews.iter().map(|r| r.rank.assessment).sum();
+        (overall / n, content / n, workload / n, assessment / n, n as i64)
+    } else {
+        (0.0, 0.0, 0.0, 0.0, 0)
+    };
+
+    println!("═══ {} [{}] ═══", course.name, course.code);
+    println!("Teachers:    {}", course.teachers);
+    println!("Credits:     {} | Hours: {} | Max students: {}", course.credit, course.week_hour, course.max_student);
+    println!("Department:  {} | Campus: {}", course.department, course.campus);
+    println!("Semester:    {}", course.semester_name());
+    if avg_rank.4 > 0 {
+        println!();
+        println!("── Average Ratings ({reviews}) ──", reviews = avg_rank.4);
+        println!("  Overall:    ★{:.1}/5", avg_rank.0);
+        println!("  Content:    ★{:.1}/5", avg_rank.1);
+        println!("  Workload:   ★{:.1}/5  (higher = lighter)", avg_rank.2);
+        println!("  Assessment: ★{:.1}/5  (higher = fairer)", avg_rank.3);
+    }
+    if !reviews.is_empty() {
+        println!();
+        print_reviews(reviews);
+    } else {
+        println!();
+        println!("(no reviews yet)");
+    }
+}
+
+fn print_reviews(reviews: &[crate::models::Review]) {
+    for (i, r) in reviews.iter().enumerate() {
+        println!(
+            "── Review #{} ({}↑) [{}] ──",
+            i + 1, r.vote, r.time_created
+        );
+        println!("  Title: {}", r.title);
+        println!("  Overall:★{:.1}  Content:★{:.1}  Workload:★{:.1}  Assessment:★{:.1}",
+            r.rank.overall, r.rank.content, r.rank.workload, r.rank.assessment);
+        println!("  {}", r.content.replace('\n', "\n  "));
+        println!();
+    }
 }
 
 async fn get_client() -> Result<DantaClient> {
