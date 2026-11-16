@@ -18,11 +18,12 @@ use cli::{Cli, Commands};
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let json = cli.json;
+    let connection = cli.connection;
 
     match cli.command {
         Some(Commands::Tui) | None => {
             let token = auth::load_token()?;
-            let mut client = api::DantaClient::with_token(token)?;
+            let mut client = api::DantaClient::with_token(token, connection).await?;
             // Auto-refresh expired token before entering TUI
             if client
                 .ensure_token()
@@ -35,7 +36,7 @@ async fn main() -> Result<()> {
         }
         #[cfg(unix)]
         Some(Commands::Serve { port, bind }) => {
-            serve::run(&bind, port).await?;
+            serve::run(&bind, port, connection).await?;
         }
         #[cfg(not(unix))]
         Some(Commands::Serve { .. }) => {
@@ -43,7 +44,7 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
         Some(cmd) => {
-            if let Err(e) = cli::run_cli(cmd, json).await {
+            if let Err(e) = cli::run_cli(cmd, json, connection).await {
                 if json {
                     println!(
                         "{}",

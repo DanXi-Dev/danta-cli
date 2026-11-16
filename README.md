@@ -32,21 +32,26 @@ To access the forum through Fudan WebVPN, first log in with your UIS account:
 danta webvpn login -u <UIS_ID>  # prompts for the UIS password without echoing it
 danta webvpn status            # verifies the saved session and forum gateway
 danta login -e <email> -p <password>  # only needed if not already logged into FDU Hole
-danta                         # the TUI and CLI now use WebVPN
+danta                         # prefers direct access, falls back to saved WebVPN
 ```
 
 UIS authenticates the WebVPN connection; your FDU Hole email/password still authenticates
-your forum account. A successful WebVPN login enables WebVPN for subsequent forum
-authentication, forum content, and supported forum images, including in the TUI. It
-does not require any campus-service features such as dining or grades.
+your forum account. With a saved WebVPN session, the CLI and TUI probe direct access
+briefly at startup. If the probe fails, they use WebVPN for forum authentication, content,
+and supported images. A direct connection failure can switch later requests in the same
+process to WebVPN. Requests are not replayed automatically after a connection failure.
 Restart an already-running TUI after logging in or removing the WebVPN session.
 
-Only the WebVPN session cookies are saved locally; the UIS password is not saved.
-The session file is `webvpn.json` in the same platform-specific configuration directory
-as `token.json` (on macOS, `~/Library/Application Support/danta-cli/`; on Linux,
-`~/.config/danta-cli/`). On Unix, the session file is readable and writable only by its
-owner. If the session expires, run `danta webvpn login -u <UIS_ID>` again. A failed
-WebVPN session is reported instead of silently switching back to direct access.
+Use `danta --connection webvpn status` to test the forum over WebVPN, or
+`danta --connection direct status` to force direct access. `danta webvpn status`
+always checks the saved WebVPN session independently of the routing preference.
+
+The client saves WebVPN session cookies and keeps them updated when the gateway
+rotates them. It does not save the UIS password. `webvpn.json` lives next to `token.json`
+in `~/Library/Application Support/danta-cli/` on macOS and in
+`$XDG_CONFIG_HOME/danta-cli/` or `~/.config/danta-cli/` on Linux. On Unix, the file is
+readable and writable only by its owner. If WebVPN requires renewed authentication,
+run `danta webvpn login -u <UIS_ID>` again.
 
 For automation, `danta webvpn login -u <UIS_ID> --password-stdin` reads the password
 from the first line of standard input. Supply it from your secret manager or another

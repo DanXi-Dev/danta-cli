@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 
 use crate::models::*;
-use crate::transport::Transport;
+use crate::transport::{ConnectionMode, Transport};
 
 const AUTH_BASE: &str = "https://auth.fduhole.com/api";
 const FORUM_BASE: &str = "https://forum.fduhole.com/api";
@@ -27,16 +27,16 @@ async fn check(resp: reqwest::Response, action: &str) -> Result<reqwest::Respons
 }
 
 impl DantaClient {
-    pub fn new() -> Result<Self> {
+    pub async fn new(connection: ConnectionMode) -> Result<Self> {
         Ok(Self {
-            http: Transport::load()?,
+            http: Transport::load(connection).await?,
             token: None,
         })
     }
 
-    pub fn with_token(token: JWToken) -> Result<Self> {
+    pub async fn with_token(token: JWToken, connection: ConnectionMode) -> Result<Self> {
         Ok(Self {
-            http: Transport::load()?,
+            http: Transport::load(connection).await?,
             token: Some(token),
         })
     }

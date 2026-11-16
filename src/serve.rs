@@ -4,7 +4,9 @@ use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-pub async fn run(bind: &str, port: u16) -> Result<()> {
+use crate::transport::ConnectionMode;
+
+pub async fn run(bind: &str, port: u16, connection: ConnectionMode) -> Result<()> {
     let addr = format!("{}:{}", bind, port);
     let listener = TcpListener::bind(&addr).await?;
 
@@ -23,7 +25,7 @@ pub async fn run(bind: &str, port: u16) -> Result<()> {
         eprintln!("[+] Connection from {}", peer);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, peer).await {
+            if let Err(e) = handle_connection(stream, peer, connection).await {
                 eprintln!("[-] Error for {}: {}", peer, e);
             }
             eprintln!("[-] Disconnected: {}", peer);
@@ -72,6 +74,7 @@ fn set_pty_size(master_fd: &OwnedFd, cols: u16, rows: u16) {
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     peer: std::net::SocketAddr,
+    connection: ConnectionMode,
 ) -> Result<()> {
     // Allocate a PTY pair
     let (master_fd, slave_fd) = open_pty().context("Failed to allocate PTY")?;
@@ -88,6 +91,7 @@ async fn handle_connection(
 
     let mut child = tokio::process::Command::new(exe)
         .arg("tui")
+        .args(["--connection", connection.as_str()])
         .env("TERM", "xterm-256color")
         .stdin(Stdio::from(slave_for_stdin))
         .stdout(Stdio::from(slave_for_stdout))

@@ -17,16 +17,27 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
+use crate::transport::{network_error, validate_webvpn_response};
+
+// Desktop default used by the Flutter DanXi UIS client.
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.51 Safari/537.36";
 const WEBVPN_HOST: &str = "webvpn.fudan.edu.cn";
-const LOGIN_AGAIN: &str = "WebVPN session is missing or expired; run `danta webvpn login`";
+const LOGIN_AGAIN: &str = "Run `danta webvpn login -u <UIS_ID>` to renew the WebVPN session.";
 
 #[derive(Clone)]
 pub struct WebVpnSession {
     jar: Arc<CookieStoreMutex>,
+    saved: Option<Arc<Mutex<SessionFile>>>,
+}
+
+struct SessionFile {
+    path: PathBuf,
+    gateway: String,
+    last_saved: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -80,9 +91,10 @@ impl Endpoints {
 }
 
 impl WebVpnSession {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             jar: Arc::new(CookieStoreMutex::new(CookieStore::default())),
+            saved: None,
         }
     }
 
@@ -96,9 +108,15 @@ impl WebVpnSession {
         }
         let session = Self::empty();
         let client = session.client_at(endpoints)?;
-        let page = get_page(&client, endpoints, endpoints.login.clone()).await?;
+        let page = get_page(
+            &client,
+            endpoints,
+            endpoints.login.clone(),
+            "WebVPN login entry",
+        )
+        .await?;
         let final_page = if let Some(ticket_url) = ticket_url(&page)? {
-            get_page(&client, endpoints, ticket_url).await?
+            get_page(&client, endpoints, ticket_url, "WebVPN ticket callback").await?
         } else if page.url.origin() == endpoints.identity.origin() {
             modern_login(&client, endpoints, page, username, password).await?
         } else if page.url.origin() == endpoints.legacy.origin() {
@@ -112,13 +130,14 @@ impl WebVpnSession {
         {
             bail!("WebVPN authentication did not reach the gateway; complete any verification in a browser and try again");
         }
-        session.check_at(endpoints).await?;
-
-        // Drop identity-provider cookies even in the returned in-memory session.
+        // Verify the same gateway-only cookies that later CLI processes restore.
         let store = session.gateway_store(endpoints.gateway.host_str().unwrap())?;
-        Ok(Self {
+        let session = Self {
             jar: Arc::new(CookieStoreMutex::new(store)),
-        })
+            saved: None,
+        };
+        session.check_at(endpoints).await?;
+        Ok(session)
     }
 
     pub fn client(&self) -> Result<Client> {
@@ -131,7 +150,7 @@ impl WebVpnSession {
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
-            .user_agent("Mozilla/5.0 danta-cli/0.1.0");
+            .user_agent(USER_AGENT);
         #[cfg(test)]
         let builder = if let Some(address) = endpoints.address {
             builder
@@ -158,7 +177,7 @@ impl WebVpnSession {
                 .lock()
                 .map_err(|_| anyhow!("WebVPN cookie storage unavailable"))?;
             if store.get_request_values(&endpoints.verify).next().is_none() {
-                bail!(LOGIN_AGAIN);
+                bail!("No usable WebVPN cookie for the forum gateway. {LOGIN_AGAIN}");
             }
         }
         let response = self
@@ -166,18 +185,32 @@ impl WebVpnSession {
             .get(endpoints.verify.clone())
             .send()
             .await
-            .map_err(|_| anyhow!("Unable to reach WebVPN; check your network and retry"))?;
+            .map_err(|error| network_error("WebVPN session check", &error))?;
+        let response = validate_webvpn_response(response)?;
         let status = response.status();
         if !(status.is_success() || status == StatusCode::UNAUTHORIZED) {
-            if status.is_redirection() {
-                bail!(LOGIN_AGAIN);
-            }
             bail!("WebVPN check failed ({status})");
         }
-        let value: Value = response.json().await.map_err(|_| anyhow!(LOGIN_AGAIN))?;
+        let updated = response.headers().contains_key(header::SET_COOKIE);
+        let value: Value = response.json().await.map_err(|error| {
+            if error.is_decode() {
+                anyhow!(
+                    "WebVPN session check received invalid forum JSON (HTTP {})",
+                    status.as_u16()
+                )
+            } else {
+                network_error("WebVPN session check", &error)
+            }
+        })?;
         // JSON 401 is the forum asking for its separate token: the gateway worked.
         if !value.is_object() && !value.is_array() {
-            bail!(LOGIN_AGAIN);
+            bail!(
+                "WebVPN session check received an unexpected forum response (HTTP {})",
+                status.as_u16()
+            );
+        }
+        if updated {
+            self.persist_cookie_updates()?;
         }
         Ok(())
     }
@@ -202,13 +235,19 @@ impl WebVpnSession {
                 .context("Invalid WebVPN cookies; run `danta webvpn login` again")?;
         let session = Self {
             jar: Arc::new(CookieStoreMutex::new(store)),
+            saved: None,
         };
         let filtered = session.gateway_store(gateway_host)?;
         if filtered.iter_unexpired().next().is_none() {
-            bail!(LOGIN_AGAIN);
+            bail!("Saved WebVPN cookies have expired. {LOGIN_AGAIN}");
         }
         Ok(Some(Self {
             jar: Arc::new(CookieStoreMutex::new(filtered)),
+            saved: Some(Arc::new(Mutex::new(SessionFile {
+                path: path.to_path_buf(),
+                gateway: gateway_host.to_owned(),
+                last_saved: bytes,
+            }))),
         }))
     }
 
@@ -230,53 +269,121 @@ impl WebVpnSession {
         self.save_to(&session_path()?, WEBVPN_HOST)
     }
 
-    fn save_to(&self, path: &Path, gateway_host: &str) -> Result<()> {
+    fn encoded_cookies(&self, gateway_host: &str) -> Result<Option<Vec<u8>>> {
         let store = self.gateway_store(gateway_host)?;
-        let cookies = store
+        let mut cookies = store
             .iter_unexpired()
-            .map(serde_json::to_value)
+            .map(|cookie| {
+                Ok::<_, serde_json::Error>((
+                    cookie.name(),
+                    String::from(&cookie.path),
+                    serde_json::to_value(cookie)?,
+                ))
+            })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         if cookies.is_empty() {
-            bail!(LOGIN_AGAIN);
+            return Ok(None);
         }
-        let bytes = serde_json::to_vec(&SavedSession {
+        cookies.sort_unstable_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+        Ok(Some(serde_json::to_vec(&SavedSession {
             version: 1,
-            cookies,
+            cookies: cookies.into_iter().map(|(_, _, cookie)| cookie).collect(),
+        })?))
+    }
+
+    fn save_to(&self, path: &Path, gateway_host: &str) -> Result<()> {
+        let bytes = self.encoded_cookies(gateway_host)?.with_context(|| {
+            format!("WebVPN returned no session cookies to save. {LOGIN_AGAIN}")
         })?;
         let dir = path.parent().context("Invalid WebVPN session path")?;
-        fs::create_dir_all(dir)?;
-        let temp = dir.join(format!(
-            ".webvpn-{}-{:016x}.tmp",
-            std::process::id(),
-            rand::random::<u64>()
-        ));
-        let result = (|| -> Result<()> {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temp)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&temp, path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
+        fs::create_dir_all(dir).with_context(|| {
+            format!(
+                "Unable to create WebVPN configuration directory {}",
+                dir.display()
+            )
+        })?;
+        let _lock = lock_session_file(path)?;
+        write_session_file(path, &bytes)
+    }
+
+    pub(crate) fn persist_cookie_updates(&self) -> Result<()> {
+        let Some(saved) = &self.saved else {
+            return Ok(());
+        };
+        let mut saved = saved
+            .lock()
+            .map_err(|_| anyhow!("WebVPN session storage unavailable"))?;
+        let _lock = lock_session_file(&saved.path)?;
+        match fs::read(&saved.path) {
+            Ok(current) if current == saved.last_saved => (),
+            Ok(_) => return Ok(()), // A different process updated the file.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()), // Logged out.
+            Err(error) => return Err(error).context("Unable to read saved WebVPN session"),
         }
-        result.context("Unable to save WebVPN session")
+        if let Some(bytes) = self.encoded_cookies(&saved.gateway)? {
+            if bytes != saved.last_saved {
+                write_session_file(&saved.path, &bytes)?;
+                saved.last_saved = bytes;
+            }
+        }
+        Ok(())
     }
 
     pub fn clear() -> Result<()> {
-        match fs::remove_file(session_path()?) {
+        let path = session_path()?;
+        if !path.try_exists()? {
+            return Ok(());
+        }
+        let _lock = lock_session_file(&path)?;
+        match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error).context("Unable to remove WebVPN session"),
         }
     }
+}
+
+fn lock_session_file(path: &Path) -> Result<fs::File> {
+    // A separate lock file still protects the path after a rename or logout.
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path.with_extension("lock"))
+        .with_context(|| format!("Unable to open WebVPN session lock for {}", path.display()))?;
+    file.lock().context("Unable to lock WebVPN session file")?;
+    Ok(file)
+}
+
+fn write_session_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().context("Invalid WebVPN session path")?;
+    let temp = dir.join(format!(
+        ".webvpn-{}-{:016x}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result.with_context(|| format!("Unable to save WebVPN session to {}", path.display()))
 }
 
 fn session_path() -> Result<PathBuf> {
@@ -291,14 +398,22 @@ struct Page {
     body: String,
 }
 
-async fn get_page(client: &Client, endpoints: &Endpoints, url: Url) -> Result<Page> {
+async fn get_page(client: &Client, endpoints: &Endpoints, url: Url, step: &str) -> Result<Page> {
     endpoints.validate(&url)?;
     let response = client
         .get(url.clone())
         .send()
         .await
-        .map_err(|_| anyhow!("Unable to reach Fudan authentication service"))?;
-    follow_redirects(client, endpoints, response, url, false).await
+        .map_err(|error| auth_network_error(step, &url, &error))?;
+    follow_redirects(client, endpoints, response, url, false, step).await
+}
+
+fn auth_network_error(step: &str, url: &Url, error: &reqwest::Error) -> anyhow::Error {
+    // Ticket and auth URLs can contain secrets. Only report the verified host.
+    network_error(
+        &format!("{step} ({})", url.host_str().unwrap_or("Fudan")),
+        error,
+    )
 }
 
 async fn follow_redirects(
@@ -307,19 +422,22 @@ async fn follow_redirects(
     mut response: Response,
     mut url: Url,
     mut was_post: bool,
+    step: &str,
 ) -> Result<Page> {
     for _ in 0..12 {
         if !response.status().is_redirection() {
             if !response.status().is_success() {
-                bail!("Fudan authentication failed ({})", response.status());
+                bail!(
+                    "{step} ({}) returned HTTP {}",
+                    url.host_str().unwrap_or("Fudan"),
+                    response.status().as_u16()
+                );
             }
-            return Ok(Page {
-                url,
-                body: response
-                    .text()
-                    .await
-                    .context("Invalid authentication response")?,
-            });
+            let body = response
+                .text()
+                .await
+                .map_err(|error| auth_network_error(step, &url, &error))?;
+            return Ok(Page { url, body });
         }
         // Never replay a credential-bearing POST body, even for 307/308.
         if was_post
@@ -343,7 +461,7 @@ async fn follow_redirects(
             .get(url.clone())
             .send()
             .await
-            .map_err(|_| anyhow!("Unable to follow Fudan authentication redirect"))?;
+            .map_err(|error| auth_network_error(step, &url, &error))?;
         was_post = false;
     }
     bail!("Too many Fudan authentication redirects")
@@ -357,7 +475,7 @@ async fn post_json(
 ) -> Result<Value> {
     let url = endpoints.identity.join(path)?;
     endpoints.validate(&url)?;
-    let request = client.post(url);
+    let request = client.post(url.clone());
     let request = if let Some(body) = body {
         request.json(body)
     } else {
@@ -366,9 +484,9 @@ async fn post_json(
     let response = request
         .send()
         .await
-        .map_err(|_| anyhow!("Unable to reach Fudan identity service"))?;
+        .map_err(|error| auth_network_error(&format!("UIS {path}"), &url, &error))?;
     if !response.status().is_success() {
-        bail!("Fudan identity service failed ({})", response.status());
+        bail!("UIS {path} returned HTTP {}", response.status().as_u16());
     }
     response
         .json()
@@ -453,18 +571,19 @@ async fn modern_login(
     let login_token = response["loginToken"].as_str().filter(|token| !token.is_empty())
         .context("Fudan requires additional verification; automatic WebVPN login cannot complete this challenge. Use the university WebVPN in a browser")?;
     let url = endpoints.identity.join("/idp/authCenter/authnEngine")?;
+    let step = "UIS login token exchange";
     let response = client
         .post(url.clone())
         .form(&[("loginToken", login_token)])
         .send()
         .await
-        .map_err(|_| anyhow!("Unable to complete Fudan identity authentication"))?;
-    let page = follow_redirects(client, endpoints, response, url, true).await?;
+        .map_err(|error| auth_network_error(step, &url, &error))?;
+    let page = follow_redirects(client, endpoints, response, url, true, step).await?;
     if page.url.origin() == endpoints.gateway.origin() && !page.url.path().starts_with("/login") {
         return Ok(page);
     }
     let url = ticket_url(&page)?.context("Fudan did not return a service ticket")?;
-    get_page(client, endpoints, url).await
+    get_page(client, endpoints, url, "WebVPN ticket callback").await
 }
 
 async fn legacy_login(
@@ -495,16 +614,17 @@ async fn legacy_login(
         fields
     };
     endpoints.validate(&page.url)?;
+    let step = "UIS password authentication";
     let response = client
         .post(page.url.clone())
         .form(&fields)
         .send()
         .await
-        .map_err(|_| anyhow!("Unable to submit UIS login"))?;
-    let page = follow_redirects(client, endpoints, response, page.url, true).await?;
+        .map_err(|error| auth_network_error(step, &page.url, &error))?;
+    let page = follow_redirects(client, endpoints, response, page.url, true, step).await?;
     check_login_error(&page.body)?;
     if let Some(url) = ticket_url(&page)? {
-        get_page(client, endpoints, url).await
+        get_page(client, endpoints, url, "WebVPN ticket callback").await
     } else {
         Ok(page)
     }
@@ -936,6 +1056,61 @@ mod tests {
                 0o600
             );
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cookie_updates_survive_reload_without_overwriting_a_new_login_or_logout() {
+        let dir = std::env::temp_dir().join(format!(
+            "danta-webvpn-rotate-{:016x}",
+            rand::random::<u64>()
+        ));
+        let path = dir.join("webvpn.json");
+        let gateway = Url::parse("https://webvpn.fudan.edu.cn/").unwrap();
+        let set_ticket = |session: &WebVpnSession, value: &str| {
+            session
+                .jar
+                .lock()
+                .unwrap()
+                .parse(
+                    &format!("wrdvpn_ticket={value}; Path=/; Secure; HttpOnly"),
+                    &gateway,
+                )
+                .unwrap();
+        };
+        let read_ticket = || {
+            let session = WebVpnSession::load_from(&path, WEBVPN_HOST)
+                .unwrap()
+                .unwrap();
+            let store = session.jar.lock().unwrap();
+            let value = store
+                .get_request_values(&gateway)
+                .next()
+                .unwrap()
+                .1
+                .to_owned();
+            value
+        };
+
+        let login = WebVpnSession::empty();
+        set_ticket(&login, "initial");
+        login.save_to(&path, WEBVPN_HOST).unwrap();
+        let active = WebVpnSession::load_from(&path, WEBVPN_HOST)
+            .unwrap()
+            .unwrap();
+        set_ticket(&active, "renewed-by-gateway");
+        active.persist_cookie_updates().unwrap();
+        assert_eq!(read_ticket(), "renewed-by-gateway");
+
+        set_ticket(&login, "new-login");
+        login.save_to(&path, WEBVPN_HOST).unwrap();
+        set_ticket(&active, "delayed-update");
+        active.persist_cookie_updates().unwrap();
+        assert_eq!(read_ticket(), "new-login");
+
+        fs::remove_file(&path).unwrap();
+        active.persist_cookie_updates().unwrap();
+        assert!(!path.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

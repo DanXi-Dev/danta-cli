@@ -1,14 +1,38 @@
-//! Shared forum transport. A saved WebVPN session explicitly selects WebVPN;
-//! requests are never replayed or silently switched back to a direct connection.
+//! Shared forum transport. Auto mode probes direct access before using a saved WebVPN session.
 use anyhow::{bail, Context, Result};
+use clap::ValueEnum;
 use reqwest::{header, redirect, Client, Method, RequestBuilder, Response, Url};
 use serde::Serialize;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use crate::webvpn::WebVpnSession;
 
 const WEBVPN_ORIGIN: &str = "https://webvpn.fudan.edu.cn";
+const DIRECT_PROBE_URL: &str = "https://forum.fduhole.com";
+const DIRECT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const LOGIN_HINT: &str = "Run `danta webvpn login -u <UIS_ID>` to renew the WebVPN session.";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum ConnectionMode {
+    #[default]
+    Auto,
+    Direct,
+    Webvpn,
+}
+
+impl ConnectionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Direct => "direct",
+            Self::Webvpn => "webvpn",
+        }
+    }
+}
 
 // Protocol routing identifiers used by DanXi-Dev/DanXi (3c1f5f0).
 // Deliberately limited to forum services; other campus services are out of scope.
@@ -79,9 +103,43 @@ pub fn proxy_url(raw: &str) -> Option<String> {
 pub struct Transport {
     direct: Client,
     public_images: Client,
-    gateway: Option<Client>,
+    gateway: Option<Gateway>,
+    use_gateway: Arc<AtomicBool>,
+    can_fall_back: bool,
     #[cfg(test)]
     test_base: Option<String>,
+}
+
+#[derive(Clone)]
+enum Gateway {
+    Ready {
+        client: Client,
+        session: WebVpnSession,
+    },
+    Unavailable(String),
+}
+
+impl Gateway {
+    fn saved() -> Option<Self> {
+        match WebVpnSession::load().and_then(|session| {
+            session
+                .map(|session| {
+                    let client = session.client()?;
+                    Ok(Self::Ready { client, session })
+                })
+                .transpose()
+        }) {
+            Ok(gateway) => gateway,
+            Err(error) => Some(Self::Unavailable(error.to_string())),
+        }
+    }
+
+    fn client(&self) -> Result<&Client> {
+        match self {
+            Self::Ready { client, .. } => Ok(client),
+            Self::Unavailable(message) => bail!("{message}"),
+        }
+    }
 }
 
 fn direct_client() -> Result<Client> {
@@ -103,20 +161,53 @@ fn public_image_client() -> Result<Client> {
 }
 
 impl Transport {
-    pub fn load() -> Result<Self> {
-        let session = WebVpnSession::load()?;
-        let gateway = session.as_ref().map(WebVpnSession::client).transpose()?;
+    pub async fn load(mode: ConnectionMode) -> Result<Self> {
+        let gateway = (mode != ConnectionMode::Direct)
+            .then(Gateway::saved)
+            .flatten();
+        Self::select(mode, direct_client()?, gateway, DIRECT_PROBE_URL).await
+    }
+
+    async fn select(
+        mode: ConnectionMode,
+        direct: Client,
+        gateway: Option<Gateway>,
+        probe_url: &str,
+    ) -> Result<Self> {
+        let can_fall_back = mode == ConnectionMode::Auto && gateway.is_some();
+        let use_gateway = match mode {
+            ConnectionMode::Webvpn => {
+                gateway
+                    .as_ref()
+                    .context(format!("No saved WebVPN session. {LOGIN_HINT}"))?
+                    .client()?;
+                true
+            }
+            ConnectionMode::Auto if can_fall_back => {
+                // Any HTTP response shows the direct route is reachable. The probe
+                // carries no forum credentials and never follows a redirect.
+                direct
+                    .get(probe_url)
+                    .timeout(DIRECT_PROBE_TIMEOUT)
+                    .send()
+                    .await
+                    .is_err()
+            }
+            _ => false,
+        };
         Ok(Self {
-            direct: direct_client()?,
+            direct,
             public_images: public_image_client()?,
             gateway,
+            use_gateway: Arc::new(AtomicBool::new(use_gateway)),
+            can_fall_back,
             #[cfg(test)]
             test_base: None,
         })
     }
 
     pub fn connection_mode(&self) -> &'static str {
-        if self.gateway.is_some() {
+        if self.use_gateway.load(Ordering::Relaxed) {
             "webvpn"
         } else {
             "direct"
@@ -129,18 +220,19 @@ impl Transport {
             direct: direct_client()?,
             public_images: public_image_client()?,
             gateway: None,
+            use_gateway: Arc::new(AtomicBool::new(false)),
+            can_fall_back: false,
             test_base: Some(base),
         })
     }
 
     fn request(&self, method: Method, raw: &str) -> TransportRequest {
-        let mapped = self.gateway.as_ref().and_then(|_| proxy_url(raw));
+        let mapped = self
+            .use_gateway
+            .load(Ordering::Relaxed)
+            .then(|| proxy_url(raw))
+            .flatten();
         let proxied = mapped.is_some();
-        let client = if proxied {
-            self.gateway.as_ref().unwrap()
-        } else {
-            &self.direct
-        };
         let url = mapped.unwrap_or_else(|| raw.to_owned());
         #[cfg(test)]
         let url = match &self.test_base {
@@ -150,9 +242,19 @@ impl Transport {
             }
             _ => url,
         };
+        let (client, session) = match (proxied, &self.gateway) {
+            (true, Some(gateway @ Gateway::Ready { session, .. })) => {
+                (gateway.client(), Some(session.clone()))
+            }
+            (true, Some(gateway)) => (gateway.client(), None),
+            _ => (Ok(&self.direct), None),
+        };
         TransportRequest {
-            inner: client.request(method, url),
+            inner: client.map(|client| client.request(method, url)),
             proxied,
+            session,
+            fall_back: (!proxied && self.can_fall_back && is_forum_origin(raw))
+                .then(|| Arc::clone(&self.use_gateway)),
         }
     }
 
@@ -162,8 +264,10 @@ impl Transport {
             self.get(url)
         } else {
             TransportRequest {
-                inner: self.public_images.get(url),
+                inner: Ok(self.public_images.get(url)),
                 proxied: false,
+                session: None,
+                fall_back: None,
             }
         }
     }
@@ -186,34 +290,48 @@ impl Transport {
 }
 
 pub struct TransportRequest {
-    inner: RequestBuilder,
+    inner: Result<RequestBuilder>,
     proxied: bool,
+    session: Option<WebVpnSession>,
+    fall_back: Option<Arc<AtomicBool>>,
 }
 
 impl TransportRequest {
     pub fn header(mut self, name: &str, value: impl AsRef<str>) -> Self {
-        self.inner = self.inner.header(name, value.as_ref());
+        self.inner = self.inner.map(|inner| inner.header(name, value.as_ref()));
         self
     }
 
     pub fn json<T: Serialize + ?Sized>(mut self, value: &T) -> Self {
-        self.inner = self.inner.json(value);
+        self.inner = self.inner.map(|inner| inner.json(value));
         self
     }
 
     pub async fn send(self) -> Result<Response> {
-        let response = self
-            .inner
-            .send()
-            .await
-            .map_err(|e| e.without_url())
-            .context(if self.proxied {
-                "WebVPN request failed"
-            } else {
-                "Request failed"
-            })?;
+        let response = self.inner?.send().await.map_err(|error| {
+            if let Some(next) = self.fall_back.filter(|_| error.is_connect() || error.is_timeout()) {
+                // Like Flutter, switch later requests. The current request may have
+                // reached the server, so never send it again on a different route.
+                next.store(true, Ordering::Relaxed);
+                return network_error("Direct forum request failed; subsequent requests in this process will use WebVPN", &error);
+            }
+            let phase = if self.proxied { "WebVPN forum request failed" } else { "Request failed" };
+            network_error(phase, &error)
+        })?;
         if self.proxied {
-            let response = validate_webvpn_response(response).await?;
+            let response = validate_webvpn_response(response)?;
+            if response.headers().contains_key(header::SET_COOKIE)
+                && (response.status().is_success()
+                    || response.status() == reqwest::StatusCode::UNAUTHORIZED)
+            {
+                if let Some(session) = self.session {
+                    // A disk write failure must not turn an already successful
+                    // forum write into an error that could cause duplicate posts.
+                    if let Err(error) = session.persist_cookie_updates() {
+                        eprintln!("Warning: could not persist updated WebVPN session: {error}");
+                    }
+                }
+            }
             Ok(response)
         } else {
             Ok(response)
@@ -221,9 +339,50 @@ impl TransportRequest {
     }
 }
 
-pub async fn validate_webvpn_response(response: Response) -> Result<Response> {
+pub(crate) fn network_error(phase: &str, error: &reqwest::Error) -> anyhow::Error {
+    let reason = if error.is_timeout() {
+        "timed out"
+    } else if error.is_connect() {
+        "could not establish a connection (DNS, TLS, or proxy)"
+    } else if error.is_body() || error.is_decode() {
+        "could not read the response"
+    } else {
+        "HTTP request failed"
+    };
+    anyhow::anyhow!("{phase}: {reason}")
+}
+
+pub(crate) fn validate_webvpn_response(response: Response) -> Result<Response> {
     if response.status().is_redirection() {
-        bail!("WebVPN redirected the request to authentication. {LOGIN_HINT}");
+        let requested = response.url();
+        let target = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|location| requested.join(location).ok());
+        let is_login = target.as_ref().is_some_and(|url| {
+            (url.origin() == requested.origin() && matches!(url.path(), "/login" | "/login/"))
+                || (url.scheme() == "https"
+                    && url.port().is_none()
+                    && matches!(url.host_str(), Some("id.fudan.edu.cn" | "uis.fudan.edu.cn")))
+        });
+        if is_login {
+            bail!(
+                "WebVPN redirected the request to authentication (HTTP {}). {LOGIN_HINT}",
+                response.status().as_u16()
+            );
+        }
+        // Never print or follow Location. It can contain a university login ticket.
+        bail!(
+            "Unexpected redirect from WebVPN (HTTP {}); the request was not followed",
+            response.status().as_u16()
+        );
+    }
+    if response.status().is_server_error() {
+        bail!(
+            "WebVPN or the upstream forum returned HTTP {}",
+            response.status().as_u16()
+        );
     }
     let content_type = response
         .headers()
@@ -232,10 +391,13 @@ pub async fn validate_webvpn_response(response: Response) -> Result<Response> {
         .unwrap_or("")
         .to_ascii_lowercase();
     if content_type.contains("text/html") || content_type.contains("application/xhtml") {
-        bail!("WebVPN returned an HTML page instead of forum data. {LOGIN_HINT}");
+        bail!(
+            "WebVPN returned HTML instead of forum data (HTTP {})",
+            response.status().as_u16()
+        );
     }
     if response.status() == reqwest::StatusCode::UNAUTHORIZED && !content_type.contains("json") {
-        bail!("WebVPN authentication is no longer valid. {LOGIN_HINT}");
+        bail!("WebVPN returned HTTP 401 without a forum JSON response. {LOGIN_HINT}");
     }
     Ok(response)
 }
@@ -326,7 +488,12 @@ mod tests {
         Transport {
             direct: direct_client().unwrap(),
             public_images: public_image_client().unwrap(),
-            gateway: Some(gateway),
+            gateway: Some(Gateway::Ready {
+                client: gateway,
+                session: WebVpnSession::empty(),
+            }),
+            use_gateway: Arc::new(AtomicBool::new(true)),
+            can_fall_back: false,
             test_base: Some(base),
         }
     }
@@ -354,21 +521,49 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_login_redirects_and_html_without_replaying_requests() {
-        for (status, content_type, extra, body) in [
-            ("302 Found", "text/html", "Location: /login\r\n", ""),
+        for (status, content_type, extra, body, message) in [
+            (
+                "302 Found",
+                "text/html",
+                "Location: /login?ticket=private-test-value\r\n",
+                "",
+                "danta webvpn login",
+            ),
             (
                 "307 Temporary Redirect",
                 "text/html",
                 "Location: /login\r\n",
                 "",
+                "danta webvpn login",
+            ),
+            (
+                "302 Found",
+                "text/html",
+                "Location: /other?ticket=private-test-value\r\n",
+                "",
+                "Unexpected redirect from WebVPN (HTTP 302)",
             ),
             (
                 "200 OK",
                 "text/html; charset=utf-8",
                 "",
                 "<html>UIS login</html>",
+                "returned HTML instead of forum data",
             ),
-            ("401 Unauthorized", "text/plain", "", "login required"),
+            (
+                "401 Unauthorized",
+                "text/plain",
+                "",
+                "login required",
+                "danta webvpn login",
+            ),
+            (
+                "500 Internal Server Error",
+                "text/html",
+                "",
+                "<html>error</html>",
+                "returned HTTP 500",
+            ),
         ] {
             let (base, recorded) = mock_once(status, content_type, extra, body).await;
             let error = gateway_transport(base)
@@ -377,9 +572,84 @@ mod tests {
                 .send()
                 .await
                 .unwrap_err();
-            assert!(error.to_string().contains("danta webvpn login"));
+            assert!(error.to_string().contains(message), "{error}");
+            assert!(!error.to_string().contains("private-test-value"));
             assert!(recorded.await.unwrap().starts_with("POST "));
         }
+    }
+
+    #[tokio::test]
+    async fn auto_prefers_direct_even_with_an_unusable_saved_session() {
+        let (probe, recorded) = mock_once("401 Unauthorized", "application/json", "", "{}").await;
+        let transport = Transport::select(
+            ConnectionMode::Auto,
+            direct_client().unwrap(),
+            Some(Gateway::Unavailable("expired session".into())),
+            &probe,
+        )
+        .await
+        .unwrap();
+        assert_eq!(transport.connection_mode(), "direct");
+        let actual = recorded.await.unwrap();
+        assert!(actual.starts_with("GET / HTTP/1.1"));
+        assert!(!actual.contains("authorization:") && !actual.contains("cookie:"));
+    }
+
+    #[tokio::test]
+    async fn auto_uses_webvpn_when_the_direct_probe_cannot_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let probe = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let (base, recorded) = mock_once("200 OK", "application/json", "", "[]").await;
+        let gateway = gateway_transport(base.clone()).gateway;
+        let mut transport = Transport::select(
+            ConnectionMode::Auto,
+            direct_client().unwrap(),
+            gateway,
+            &probe,
+        )
+        .await
+        .unwrap();
+        transport.test_base = Some(base);
+        assert_eq!(transport.connection_mode(), "webvpn");
+        transport
+            .get("https://forum.fduhole.com/api/divisions")
+            .send()
+            .await
+            .unwrap();
+        assert!(recorded.await.unwrap().starts_with("GET /https/"));
+    }
+
+    #[tokio::test]
+    async fn a_direct_write_failure_switches_future_requests_without_replaying_the_write() {
+        let (probe, recorded) = mock_once("200 OK", "application/json", "", "[]").await;
+        let (base, gateway_received) = mock_once("200 OK", "application/json", "", "[]").await;
+        let gateway = gateway_transport(base.clone()).gateway;
+        let mut transport = Transport::select(
+            ConnectionMode::Auto,
+            direct_client().unwrap(),
+            gateway,
+            &probe,
+        )
+        .await
+        .unwrap();
+        recorded.await.unwrap();
+        transport.test_base = Some(probe); // The direct listener closed after the probe.
+        let error = transport
+            .post("https://forum.fduhole.com/api/holes")
+            .json(&serde_json::json!({"test": true}))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("subsequent requests"));
+        assert_eq!(transport.connection_mode(), "webvpn");
+        transport.test_base = Some(base);
+        transport
+            .get("https://forum.fduhole.com/api/divisions")
+            .send()
+            .await
+            .unwrap();
+        assert!(gateway_received.await.unwrap().starts_with("GET /https/"));
     }
 
     #[tokio::test]

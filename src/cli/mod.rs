@@ -6,6 +6,7 @@ use std::io::{self, BufRead, IsTerminal};
 
 use crate::api::DantaClient;
 use crate::auth;
+use crate::transport::ConnectionMode;
 use crate::webvpn::WebVpnSession;
 
 #[derive(Parser)]
@@ -17,6 +18,10 @@ pub struct Cli {
     /// Output results as JSON (for agent/programmatic use)
     #[arg(long, global = true)]
     pub json: bool,
+
+    /// Choose how to connect to the forum
+    #[arg(long, global = true, value_enum, default_value = "auto")]
+    pub connection: ConnectionMode,
 }
 
 #[derive(Subcommand)]
@@ -208,7 +213,7 @@ pub enum Commands {
 
 #[derive(Subcommand)]
 pub enum WebVpnCommand {
-    /// Log in with UIS and use WebVPN for subsequent forum requests
+    /// Log in with UIS and save a WebVPN session for forum access
     Login {
         /// UIS student or staff ID
         #[arg(short, long)]
@@ -249,10 +254,10 @@ fn json_out<T: Serialize>(data: &T) {
     println!("{}", serde_json::to_string(data).unwrap());
 }
 
-pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
+pub async fn run_cli(cmd: Commands, json: bool, connection: ConnectionMode) -> Result<()> {
     match cmd {
         Commands::Login { email, password } => {
-            let mut client = DantaClient::new()?;
+            let mut client = DantaClient::new(connection).await?;
             client.login(&email, &password).await?;
             auth::save_token(client.token().unwrap())?;
             if json {
@@ -263,7 +268,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
         }
         Commands::Webvpn { command } => run_webvpn(command, json).await?,
         Commands::Me => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let user = client.get_me().await?;
             if json {
                 json_out(&user);
@@ -275,7 +280,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Divisions => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let divs = client.get_divisions().await?;
             if json {
                 json_out(&divs);
@@ -292,7 +297,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             offset,
             tag,
         } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let holes = client
                 .get_holes(division, offset.as_deref(), limit, &order)
                 .await?;
@@ -332,7 +337,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             order,
             reverse,
         } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let hole = client.get_hole(hole_id).await?;
             let mut floors = client
                 .get_floors(hole_id, offset, limit, order.as_deref())
@@ -372,7 +377,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Search { query, limit } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let floors = client.search_floors(&query, 0, limit).await?;
             if json {
                 json_out(&floors);
@@ -393,7 +398,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             division,
             tags,
         } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let tag_names: Vec<String> = if tags.is_empty() {
                 vec![]
             } else {
@@ -407,7 +412,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Reply { hole_id, content } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let floor = client.reply_to_hole(hole_id, &content).await?;
             if json {
                 json_out(&floor);
@@ -416,7 +421,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Like { floor_id, value } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let floor = client.like_floor(floor_id, value).await?;
             if json {
                 json_out(&floor);
@@ -433,7 +438,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::DeleteFloor { floor_id, reason } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             client.delete_floor(floor_id, &reason).await?;
             if json {
                 json_status(format!("Deleted floor #{}", floor_id));
@@ -442,7 +447,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::History { floor_id } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let history = client.get_floor_history(floor_id).await?;
             if json {
                 json_out(&history);
@@ -457,7 +462,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Fav { hole_id } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             client.add_favorite(hole_id).await?;
             if json {
                 json_status(format!("Added hole #{} to favorites", hole_id));
@@ -466,7 +471,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Unfav { hole_id } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             client.remove_favorite(hole_id).await?;
             if json {
                 json_status(format!("Removed hole #{} from favorites", hole_id));
@@ -475,7 +480,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Favs => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let ids = client.get_favorite_ids().await?;
             if json {
                 json_out(&ids);
@@ -489,7 +494,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Sub { hole_id } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             client.add_subscription(hole_id).await?;
             if json {
                 json_status(format!("Subscribed to hole #{}", hole_id));
@@ -498,7 +503,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Unsub { hole_id } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             client.remove_subscription(hole_id).await?;
             if json {
                 json_status(format!("Unsubscribed from hole #{}", hole_id));
@@ -507,7 +512,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Subs => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let ids = client.get_subscription_ids().await?;
             if json {
                 json_out(&ids);
@@ -521,7 +526,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Messages { unread } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let msgs = client.get_messages(unread).await?;
             if json {
                 json_out(&msgs);
@@ -541,7 +546,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::ClearMessages => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             client.clear_messages().await?;
             if json {
                 json_status("All messages cleared");
@@ -550,7 +555,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Report { floor_id, reason } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             client.report_floor(floor_id, &reason).await?;
             if json {
                 json_status(format!("Reported floor #{}", floor_id));
@@ -559,7 +564,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Tags => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let tags = client.get_tags().await?;
             if json {
                 json_out(&tags);
@@ -570,7 +575,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::MyHoles { limit } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let holes = client.get_my_holes(None, limit).await?;
             if json {
                 json_out(&holes);
@@ -589,7 +594,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::MyFloors { limit } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let floors = client.get_my_floors(0, limit).await?;
             if json {
                 json_out(&floors);
@@ -603,7 +608,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::EditFloor { floor_id, content } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let floor = client.edit_floor(floor_id, &content).await?;
             if json {
                 json_out(&floor);
@@ -612,7 +617,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Floor { floor_id } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let f = client.get_floor(floor_id).await?;
             if json {
                 json_out(&f);
@@ -628,7 +633,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Punishments => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let puns = client.get_my_punishments().await?;
             if json {
                 json_out(&puns);
@@ -644,7 +649,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Status => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let user = client.get_me().await?;
             if json {
                 json_out(&serde_json::json!({
@@ -660,7 +665,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Images { hole_id } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let hole = client.get_hole(hole_id).await?;
             let total = hole.reply as u32 + 1;
             let floors = client.get_floors(hole_id, 0, total.max(100), None).await?;
@@ -701,7 +706,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
         }
         Commands::Tui | Commands::Serve { .. } => unreachable!(),
         Commands::Courses { group, search } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             if let Some(gid) = group {
                 let cg = client.get_course_group(gid).await?;
                 let courses = apply_search(&cg.courses, &search);
@@ -722,7 +727,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Course { course_id } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let course = client.get_course(course_id).await?;
             let reviews = client.list_reviews(course_id).await?;
             if json {
@@ -737,7 +742,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Reviews { course_id } => {
-            let client = get_client().await?;
+            let client = get_client(connection).await?;
             let reviews = client.list_reviews(course_id).await?;
             if json {
                 json_out(&reviews);
@@ -846,9 +851,9 @@ fn print_reviews(reviews: &[crate::models::Review]) {
     }
 }
 
-async fn get_client() -> Result<DantaClient> {
+async fn get_client(connection: ConnectionMode) -> Result<DantaClient> {
     let token = auth::load_token()?;
-    let mut client = DantaClient::with_token(token)?;
+    let mut client = DantaClient::with_token(token, connection).await?;
     // Propagate connectivity and WebVPN errors without treating them as expired tokens.
     if client.ensure_token().await? {
         auth::save_token(client.token().unwrap())?;
@@ -866,9 +871,9 @@ async fn run_webvpn(command: WebVpnCommand, json: bool) -> Result<()> {
             let session = WebVpnSession::login(&username, &password).await?;
             session.save()?;
             if json {
-                json_status("WebVPN login successful. Forum requests now use WebVPN.");
+                json_status("WebVPN login successful. Session saved for forum access.");
             } else {
-                println!("WebVPN login successful. Forum requests now use WebVPN.");
+                println!("WebVPN login successful. Session saved for forum access.");
                 println!("Your FDU Hole account is separate; use `danta login` if needed.");
             }
         }
