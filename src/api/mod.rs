@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 use anyhow::{Context, Result, bail};
-use reqwest::Client;
+use reqwest::StatusCode;
 
 use crate::models::*;
+use crate::transport::Transport;
 
 const AUTH_BASE: &str = "https://auth.fduhole.com/api";
 const FORUM_BASE: &str = "https://forum.fduhole.com/api";
@@ -10,7 +11,7 @@ const CURRICULUM_BASE: &str = "https://danke.fduhole.com/api";
 
 #[derive(Clone)]
 pub struct DantaClient {
-    http: Client,
+    http: Transport,
     token: Option<JWToken>,
 }
 
@@ -26,18 +27,18 @@ async fn check(resp: reqwest::Response, action: &str) -> Result<reqwest::Respons
 }
 
 impl DantaClient {
-    pub fn new() -> Self {
-        Self {
-            http: Client::new(),
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            http: Transport::load()?,
             token: None,
-        }
+        })
     }
 
-    pub fn with_token(token: JWToken) -> Self {
-        Self {
-            http: Client::new(),
+    pub fn with_token(token: JWToken) -> Result<Self> {
+        Ok(Self {
+            http: Transport::load()?,
             token: Some(token),
-        }
+        })
     }
 
     pub fn token(&self) -> Option<&JWToken> {
@@ -55,8 +56,12 @@ impl DantaClient {
         Ok(("Authorization", format!("Bearer {}", self.access_token()?)))
     }
 
-    pub fn http(&self) -> &Client {
+    pub fn http(&self) -> &Transport {
         &self.http
+    }
+
+    pub fn connection_mode(&self) -> &'static str {
+        self.http.connection_mode()
     }
 
     pub fn auth_value(&self) -> Option<String> {
@@ -113,10 +118,12 @@ impl DantaClient {
             .header(k, v)
             .send()
             .await?;
-        if resp.status().is_success() {
+        if resp.status() != StatusCode::UNAUTHORIZED {
+            check(resp, "Check forum session").await?;
             return Ok(false);
         }
-        // Token expired, try refresh
+        // Only a forum 401 means the forum token needs refreshing.
+        // WebVPN session failures are reported by the transport before this point.
         self.refresh_token().await?;
         Ok(true)
     }
@@ -662,5 +669,107 @@ impl DantaClient {
             .await?;
         let resp = check(resp, "Create review").await?;
         Ok(resp.json().await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+
+    async fn mock_client(
+        division_status: u16,
+    ) -> (DantaClient, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 1024];
+                while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let size = stream.read(&mut buffer).await.unwrap();
+                    if size == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buffer[..size]);
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                let refreshing = request.starts_with("POST /api/refresh ");
+                recorded.lock().unwrap().push(request);
+                let (status, body) = if refreshing {
+                    (200, r#"{"access":"new-access","refresh":"new-refresh"}"#)
+                } else {
+                    (division_status, "[]")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = DantaClient {
+            http: Transport::for_test(base).unwrap(),
+            token: Some(JWToken {
+                access: "old-access".into(),
+                refresh: "old-refresh".into(),
+            }),
+        };
+        (client, requests, task)
+    }
+
+    #[tokio::test]
+    async fn valid_forum_session_does_not_refresh() {
+        let (mut client, requests, task) = mock_client(200).await;
+        let result = client.ensure_token().await;
+        task.abort();
+
+        assert!(!result.unwrap());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /api/divisions "));
+        assert_eq!(client.token().unwrap().access, "old-access");
+    }
+
+    #[tokio::test]
+    async fn forum_401_refreshes_once_with_refresh_token() {
+        let (mut client, requests, task) = mock_client(401).await;
+        let result = client.ensure_token().await;
+        task.abort();
+
+        assert!(result.unwrap());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /api/divisions "));
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer old-access\r\n"));
+        assert!(requests[1].starts_with("POST /api/refresh "));
+        assert!(requests[1]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer old-refresh\r\n"));
+        assert_eq!(client.token().unwrap().access, "new-access");
+        assert_eq!(client.token().unwrap().refresh, "new-refresh");
+    }
+
+    #[tokio::test]
+    async fn non_auth_failures_are_reported_without_refreshing() {
+        for status in [403, 500, 503] {
+            let (mut client, requests, task) = mock_client(status).await;
+            let result = client.ensure_token().await;
+            task.abort();
+
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("Check forum session failed"), "{error}");
+            assert!(error.contains(&status.to_string()), "{error}");
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert_eq!(client.token().unwrap().access, "old-access");
+        }
     }
 }

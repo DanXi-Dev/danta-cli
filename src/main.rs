@@ -5,9 +5,11 @@ pub mod config;
 mod models;
 #[cfg(unix)]
 mod serve;
+mod transport;
 mod tui;
+mod webvpn;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 
 use cli::{Cli, Commands};
@@ -20,19 +22,14 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Tui) | None => {
             let token = auth::load_token()?;
-            let mut client = api::DantaClient::with_token(token);
+            let mut client = api::DantaClient::with_token(token)?;
             // Auto-refresh expired token before entering TUI
-            match client.ensure_token().await {
-                Ok(true) => {
-                    // Token was refreshed, save it
-                    auth::save_token(client.token().unwrap())?;
-                }
-                Ok(false) => {} // Token still valid
-                Err(e) => {
-                    eprintln!("Token expired and refresh failed: {}", e);
-                    eprintln!("Please re-login: danta login -e <email> -p <password>");
-                    std::process::exit(1);
-                }
+            if client
+                .ensure_token()
+                .await
+                .context("Could not connect to the forum")?
+            {
+                auth::save_token(client.token().unwrap())?;
             }
             tui::run(client).await?;
         }
@@ -52,6 +49,7 @@ async fn main() -> Result<()> {
                         "{}",
                         serde_json::json!({"status": "error", "message": e.to_string()})
                     );
+                    std::process::exit(1);
                 } else {
                     return Err(e);
                 }

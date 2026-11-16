@@ -1,10 +1,12 @@
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use regex::Regex;
 use serde::Serialize;
+use std::io::{self, BufRead, IsTerminal};
 
 use crate::api::DantaClient;
 use crate::auth;
+use crate::webvpn::WebVpnSession;
 
 #[derive(Parser)]
 #[command(name = "danta", about = "FDU Hole (树洞) CLI/TUI client", version)]
@@ -25,6 +27,11 @@ pub enum Commands {
         email: String,
         #[arg(short, long)]
         password: String,
+    },
+    /// Manage UIS authentication for WebVPN access to the forum
+    Webvpn {
+        #[command(subcommand)]
+        command: WebVpnCommand,
     },
     /// Show current user info
     Me,
@@ -199,6 +206,23 @@ pub enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+pub enum WebVpnCommand {
+    /// Log in with UIS and use WebVPN for subsequent forum requests
+    Login {
+        /// UIS student or staff ID
+        #[arg(short, long)]
+        username: String,
+        /// Read the UIS password from the first line of standard input
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Check the saved WebVPN session with a read-only forum request
+    Status,
+    /// Remove the local WebVPN session and return to direct access
+    Logout,
+}
+
 // Helper struct for JSON output of View command
 #[derive(Serialize)]
 struct ViewOutput {
@@ -228,7 +252,7 @@ fn json_out<T: Serialize>(data: &T) {
 pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
     match cmd {
         Commands::Login { email, password } => {
-            let mut client = DantaClient::new();
+            let mut client = DantaClient::new()?;
             client.login(&email, &password).await?;
             auth::save_token(client.token().unwrap())?;
             if json {
@@ -237,6 +261,7 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
                 println!("Login successful! Token saved.");
             }
         }
+        Commands::Webvpn { command } => run_webvpn(command, json).await?,
         Commands::Me => {
             let client = get_client().await?;
             let user = client.get_me().await?;
@@ -619,65 +644,19 @@ pub async fn run_cli(cmd: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Status => {
-            let token = auth::load_token();
-            match token {
-                Err(e) => {
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::json!({"status": "error", "message": e.to_string()})
-                        );
-                    } else {
-                        println!("Not logged in: {}", e);
-                    }
-                }
-                Ok(t) => {
-                    let mut client = DantaClient::with_token(t);
-                    match client.get_me().await {
-                        Ok(user) => {
-                            if json {
-                                json_out(&serde_json::json!({
-                                    "status": "ok",
-                                    "user_id": user.user_id,
-                                    "nickname": user.nickname,
-                                }));
-                            } else {
-                                println!("Token valid");
-                                println!("User ID:  {}", user.user_id);
-                                println!("Nickname: {}", user.nickname);
-                            }
-                        }
-                        Err(e) => {
-                            match client.ensure_token().await {
-                                Ok(true) => {
-                                    auth::save_token(client.token().unwrap())?;
-                                    let user = client.get_me().await?;
-                                    if json {
-                                        json_out(&serde_json::json!({
-                                            "status": "ok",
-                                            "user_id": user.user_id,
-                                            "nickname": user.nickname,
-                                        }));
-                                    } else {
-                                        println!("Token refreshed");
-                                        println!("User ID:  {}", user.user_id);
-                                        println!("Nickname: {}", user.nickname);
-                                    }
-                                }
-                                _ => {
-                                    if json {
-                                        println!(
-                                            "{}",
-                                            serde_json::json!({"status": "error", "message": e.to_string()})
-                                        );
-                                    } else {
-                                        println!("Token invalid: {}", e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            let client = get_client().await?;
+            let user = client.get_me().await?;
+            if json {
+                json_out(&serde_json::json!({
+                    "status": "ok",
+                    "connection": client.connection_mode(),
+                    "user_id": user.user_id,
+                    "nickname": user.nickname,
+                }));
+            } else {
+                println!("Forum session valid ({})", client.connection_mode());
+                println!("User ID:  {}", user.user_id);
+                println!("Nickname: {}", user.nickname);
             }
         }
         Commands::Images { hole_id } => {
@@ -869,12 +848,85 @@ fn print_reviews(reviews: &[crate::models::Review]) {
 
 async fn get_client() -> Result<DantaClient> {
     let token = auth::load_token()?;
-    let mut client = DantaClient::with_token(token);
-    // Auto-refresh expired token
-    if let Ok(true) = client.ensure_token().await {
+    let mut client = DantaClient::with_token(token)?;
+    // Propagate connectivity and WebVPN errors without treating them as expired tokens.
+    if client.ensure_token().await? {
         auth::save_token(client.token().unwrap())?;
     }
     Ok(client)
+}
+
+async fn run_webvpn(command: WebVpnCommand, json: bool) -> Result<()> {
+    match command {
+        WebVpnCommand::Login {
+            username,
+            password_stdin,
+        } => {
+            let password = read_uis_password(password_stdin)?;
+            let session = WebVpnSession::login(&username, &password).await?;
+            session.save()?;
+            if json {
+                json_status("WebVPN login successful. Forum requests now use WebVPN.");
+            } else {
+                println!("WebVPN login successful. Forum requests now use WebVPN.");
+                println!("Your FDU Hole account is separate; use `danta login` if needed.");
+            }
+        }
+        WebVpnCommand::Status => {
+            let session = WebVpnSession::load()?.context(
+                "WebVPN is not enabled. Run `danta webvpn login -u <UIS_ID>` to enable it.",
+            )?;
+            session.check().await?;
+            if json {
+                json_out(&serde_json::json!({
+                    "status": "ok",
+                    "connection": "webvpn",
+                    "message": "WebVPN session valid; forum gateway reachable",
+                }));
+            } else {
+                println!("WebVPN session valid; forum gateway reachable.");
+            }
+        }
+        WebVpnCommand::Logout => {
+            WebVpnSession::clear()?;
+            if json {
+                json_status("Local WebVPN session removed. Forum requests now use direct access.");
+            } else {
+                println!("Local WebVPN session removed. Forum requests now use direct access.");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_uis_password(password_stdin: bool) -> Result<String> {
+    let password = if password_stdin {
+        let mut input = String::new();
+        io::stdin()
+            .lock()
+            .read_line(&mut input)
+            .context("Could not read UIS password from standard input")?;
+        strip_password_line_ending(input)
+    } else {
+        if !io::stdin().is_terminal() {
+            bail!("For non-interactive login, provide the UIS password with --password-stdin");
+        }
+        rpassword::prompt_password("UIS password: ").context("Could not read UIS password")?
+    };
+    if password.is_empty() {
+        bail!("UIS password cannot be empty");
+    }
+    Ok(password)
+}
+
+fn strip_password_line_ending(mut input: String) -> String {
+    if input.ends_with('\n') {
+        input.pop();
+        if input.ends_with('\r') {
+            input.pop();
+        }
+    }
+    input
 }
 
 fn truncate_str(s: &str, max_chars: usize) -> String {
@@ -884,5 +936,74 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
         format!("{}...", truncated)
     } else {
         truncated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn webvpn_login_prompts_by_default() {
+        let cli = Cli::try_parse_from(["danta", "webvpn", "login", "-u", "12345"]).unwrap();
+        assert!(matches!(cli.command,
+            Some(Commands::Webvpn { command: WebVpnCommand::Login { username, password_stdin: false } })
+            if username == "12345"));
+    }
+
+    #[test]
+    fn webvpn_login_supports_stdin_and_json() {
+        let cli = Cli::try_parse_from([
+            "danta",
+            "webvpn",
+            "login",
+            "--username",
+            "12345",
+            "--password-stdin",
+            "--json",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Webvpn {
+                command: WebVpnCommand::Login {
+                    password_stdin: true,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn webvpn_login_requires_username_and_rejects_password_argument() {
+        assert!(Cli::try_parse_from(["danta", "webvpn", "login"]).is_err());
+        assert!(Cli::try_parse_from([
+            "danta",
+            "webvpn",
+            "login",
+            "-u",
+            "12345",
+            "--password",
+            "secret",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn webvpn_status_and_logout_need_no_forum_credentials() {
+        for command in ["status", "logout"] {
+            assert!(Cli::try_parse_from(["danta", "webvpn", command]).is_ok());
+        }
+    }
+
+    #[test]
+    fn stdin_password_preserves_spaces_and_removes_only_line_ending() {
+        assert_eq!(
+            strip_password_line_ending(" secret  \n".into()),
+            " secret  "
+        );
+        assert_eq!(strip_password_line_ending("secret\r\n".into()), "secret");
+        assert_eq!(strip_password_line_ending("secret".into()), "secret");
     }
 }

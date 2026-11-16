@@ -7,6 +7,7 @@ FDU Hole (树洞) terminal client — TUI, CLI, and telnet server all in one.
 - **TUI** — full interactive terminal UI with image rendering, search, settings
 - **CLI** — all operations available as commands, with `--json` for agent/programmatic use
 - **Serve** — telnet server that exposes the TUI over the network
+- **WebVPN** — UIS login for WebVPN access to forum authentication, posts, and images
 
 ## Install
 
@@ -22,6 +23,52 @@ cargo build --release
 ```bash
 danta login -e <email> -p <password>
 ```
+
+### UIS / WebVPN
+
+To access the forum through Fudan WebVPN, first log in with your UIS account:
+
+```bash
+danta webvpn login -u <UIS_ID>  # prompts for the UIS password without echoing it
+danta webvpn status            # verifies the saved session and forum gateway
+danta login -e <email> -p <password>  # only needed if not already logged into FDU Hole
+danta                         # the TUI and CLI now use WebVPN
+```
+
+UIS authenticates the WebVPN connection; your FDU Hole email/password still authenticates
+your forum account. A successful WebVPN login enables WebVPN for subsequent forum
+authentication, forum content, and supported forum images, including in the TUI. It
+does not require any campus-service features such as dining or grades.
+Restart an already-running TUI after logging in or removing the WebVPN session.
+
+Only the WebVPN session cookies are saved locally; the UIS password is not saved.
+The session file is `webvpn.json` in the same platform-specific configuration directory
+as `token.json` (on macOS, `~/Library/Application Support/danta-cli/`; on Linux,
+`~/.config/danta-cli/`). On Unix, the session file is readable and writable only by its
+owner. If the session expires, run `danta webvpn login -u <UIS_ID>` again. A failed
+WebVPN session is reported instead of silently switching back to direct access.
+
+For automation, `danta webvpn login -u <UIS_ID> --password-stdin` reads the password
+from the first line of standard input. Supply it from your secret manager or another
+private input source; there is no UIS password command-line argument.
+
+```bash
+danta webvpn logout  # removes the local WebVPN session and restores direct access
+```
+
+This removes this client's saved session only; it does not sign out other browser
+sessions. CAPTCHA and additional verification cannot currently be completed by the CLI;
+use the university WebVPN in a browser when these challenges are required. Browser
+sign-in does not transfer its session into this CLI. Weak-password and maintenance
+responses also stop login; resolve those conditions before retrying.
+
+The authentication and routing protocol follows the Flutter
+[DanXi main repository](https://github.com/DanXi-Dev/DanXi) at commit
+`3c1f5f026fbc7ca50e151865f813cdb381807abe`:
+[identity login](https://github.com/DanXi-Dev/DanXi/blob/3c1f5f026fbc7ca50e151865f813cdb381807abe/lib/repository/fdu/neo_login_tool.dart)
+and [WebVPN routing](https://github.com/DanXi-Dev/DanXi/blob/3c1f5f026fbc7ca50e151865f813cdb381807abe/lib/util/webvpn_proxy.dart).
+It supports the current `id.fudan.edu.cn` password and ticket flow, with a legacy
+UIS form fallback. Interactive browser verification is not embedded in this CLI.
 
 ### TUI Mode (default)
 

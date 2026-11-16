@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use crate::api::DantaClient;
 use crate::config::{BorderStyle, DantaConfig, ThumbnailRenderMode};
 use crate::models::*;
+use crate::transport::{self, Transport};
 
 // ── ASCII Art Banner (rowancap font, same as pikpaktui) ──
 
@@ -345,7 +346,7 @@ fn open_settings(app: &mut App) {
 
 fn spawn_image_fetch(
     tx: mpsc::UnboundedSender<ImageResult>,
-    http: reqwest::Client,
+    http: Transport,
     auth: Option<String>,
     url: String,
 ) {
@@ -356,16 +357,18 @@ fn spawn_image_fetch(
 }
 
 async fn fetch_image(
-    http: &reqwest::Client,
+    http: &Transport,
     auth: Option<&str>,
     url: &str,
 ) -> anyhow::Result<image::DynamicImage> {
     use image::ImageReader;
     use std::io::Cursor;
 
-    let mut req = http.get(url);
-    if let Some(token) = auth {
-        req = req.header("Authorization", token);
+    let mut req = http.image(url);
+    if transport::is_forum_origin(url) {
+        if let Some(token) = auth {
+            req = req.header("Authorization", token);
+        }
     }
     let resp = req.send().await?;
     if !resp.status().is_success() {
@@ -2310,4 +2313,112 @@ fn render_messages(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("\u{203a} ");
 
     f.render_stateful_widget(list, area, &mut app.message_list_state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn image_fetch_only_sends_bearer_to_trusted_origin() {
+        for trusted in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 1024];
+                while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let size = stream.read(&mut buffer).await.unwrap();
+                    assert_ne!(size, 0);
+                    bytes.extend_from_slice(&buffer[..size]);
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                let mut png = Cursor::new(Vec::new());
+                image::DynamicImage::new_rgba8(1, 1)
+                    .write_to(&mut png, image::ImageFormat::Png)
+                    .unwrap();
+                let png = png.into_inner();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    png.len()
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(&png).await.unwrap();
+                request
+            });
+            let transport = Transport::for_test(base.clone()).unwrap();
+            let url = if trusted {
+                "https://image.fduhole.com/picture.png".to_owned()
+            } else {
+                format!("{base}/picture.png")
+            };
+            let result = fetch_image(&transport, Some("Bearer image-token"), &url).await;
+            let request = task.await.unwrap().to_ascii_lowercase();
+            let image = result.unwrap();
+            assert_eq!((image.width(), image.height()), (1, 1));
+            assert_eq!(
+                request.contains("authorization: bearer image-token\r\n"),
+                trusted,
+                "{request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_image_redirects_do_not_send_bearer_or_retain_cookies() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for redirected in [false, true] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 1024];
+                while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let size = stream.read(&mut buffer).await.unwrap();
+                    assert_ne!(size, 0);
+                    bytes.extend_from_slice(&buffer[..size]);
+                }
+                requests.push(String::from_utf8(bytes).unwrap());
+                if !redirected {
+                    stream.write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: /picture.png\r\nSet-Cookie: unrelated=secret; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ).await.unwrap();
+                } else {
+                    let mut png = Cursor::new(Vec::new());
+                    image::DynamicImage::new_rgba8(1, 1)
+                        .write_to(&mut png, image::ImageFormat::Png)
+                        .unwrap();
+                    let png = png.into_inner();
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        png.len()
+                    );
+                    stream.write_all(headers.as_bytes()).await.unwrap();
+                    stream.write_all(&png).await.unwrap();
+                }
+            }
+            requests
+        });
+        let transport = Transport::for_test(base.clone()).unwrap();
+        let result = fetch_image(&transport, Some("Bearer image-token"), &format!("{base}/redirect")).await;
+        if result.is_err() {
+            task.abort();
+        }
+        let image = result.unwrap();
+        assert_eq!((image.width(), image.height()), (1, 1));
+        let requests = task.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /redirect "));
+        assert!(requests[1].starts_with("GET /picture.png "));
+        for request in requests {
+            let request = request.to_ascii_lowercase();
+            assert!(!request.contains("authorization:"), "{request}");
+            assert!(!request.contains("\r\ncookie:"), "{request}");
+        }
+    }
 }
