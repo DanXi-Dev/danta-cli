@@ -25,6 +25,7 @@ use crate::transport::{network_error, validate_webvpn_response};
 
 // Desktop default used by the Flutter DanXi UIS client.
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.51 Safari/537.36";
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const WEBVPN_HOST: &str = "webvpn.fudan.edu.cn";
 const LOGIN_AGAIN: &str = "Run `danta webvpn login -u <UIS_ID>` to renew the WebVPN session.";
 
@@ -148,7 +149,8 @@ impl WebVpnSession {
         let builder = Client::builder()
             .cookie_provider(self.jar.clone())
             .redirect(Policy::none())
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(AUTH_TIMEOUT)
+            .read_timeout(AUTH_TIMEOUT)
             .timeout(Duration::from_secs(30))
             .user_agent(USER_AGENT);
         #[cfg(test)]
@@ -202,8 +204,13 @@ impl WebVpnSession {
                 network_error("WebVPN session check", &error)
             }
         })?;
-        // JSON 401 is the forum asking for its separate token: the gateway worked.
-        if !value.is_object() && !value.is_array() {
+        // Divisions is a list, or a JSON error from the forum when no JWT was sent.
+        let is_forum_response = if status == StatusCode::UNAUTHORIZED {
+            value.is_object()
+        } else {
+            value.is_array()
+        };
+        if !is_forum_response {
             bail!(
                 "WebVPN session check received an unexpected forum response (HTTP {})",
                 status.as_u16()
@@ -632,8 +639,8 @@ async fn legacy_login(
 
 fn ticket_url(page: &Page) -> Result<Option<Url>> {
     let document = Html::parse_document(&page.body);
-    let form = Selector::parse("form#logon").unwrap();
-    let ticket = Selector::parse("input#ticket").unwrap();
+    let form = Selector::parse("#logon").unwrap();
+    let ticket = Selector::parse("#ticket").unwrap();
     let Some(form) = document.select(&form).next() else {
         return Ok(None);
     };
@@ -641,7 +648,7 @@ fn ticket_url(page: &Page) -> Result<Option<Url>> {
         .value()
         .attr("action")
         .context("Missing service-ticket destination")?;
-    let ticket = form
+    let ticket = document
         .select(&ticket)
         .next()
         .and_then(|input| input.value().attr("value"))
@@ -808,7 +815,11 @@ mod tests {
         let (address, server) = mock_server(request_count, move |index, request, address| {
             match index {
                 0 => {
+                    assert_eq!(request.method, "GET");
                     assert_eq!(request.path, "/login?cas_login=true");
+                    assert!(request
+                        .headers
+                        .contains(&format!("user-agent: {USER_AGENT}\r\n")));
                     reply(
                         302,
                         &[
@@ -882,7 +893,7 @@ mod tests {
                         200,
                         &[],
                         &format!(
-                            r#"<form id="logon" action="http://webvpn.test:{}/callback?keep=1"><input id="ticket" value="T&amp;1"></form>"#,
+                            r#"<form id="logon" action="http://webvpn.test:{}/callback?keep=1"></form><input form="logon" id="ticket" value="T&amp;1">"#,
                             address.port()
                         ),
                     )
